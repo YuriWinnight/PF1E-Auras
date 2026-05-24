@@ -1,0 +1,32 @@
+{
+  "id": "pf1e-auras",
+  "title": "PF1e Auras",
+  "description": "Автоматические командные ауры для Pathfinder 1e на Foundry VTT 11.",
+  "version": "0.1.8",
+  "authors": [
+    {
+      "name": "Yuri + ChatGPT"
+    }
+  ],
+  "compatibility": {
+    "minimum": "11",
+    "verified": "11.315",
+    "maximum": "11"
+  },
+  "systems": [
+    "pf1"
+  ],
+  "scripts": [
+    "scripts/main.js"
+  ],
+  "styles": [
+    "styles/pod-pyvo-auras.css"
+  ],
+  "languages": [
+    {
+      "lang": "ru",
+      "name": "Русский",
+      "path": "lang/ru.json"
+    }
+  ]
+}
