@@ -1,6 +1,6 @@
 /*
- * PF1e Auras v0.1.8
- * Foundry VTT 11.315 / PF1e first playable version, added GM socket tick requests and more robust player-owned party detection.
+ * Pathfinder 1e Auras v0.1.11
+ * Foundry VTT 11.315 / PF1e first playable version, negative aura source toggle decoupling patch.
  *
  * Основная идея:
  * - Настройки ауры хранятся на Item через flags[pf1e-auras].aura.
@@ -63,6 +63,7 @@ Hooks.once("init", () => {
 Hooks.once("ready", () => {
   registerPublicApi();
   registerSocketListener();
+  patchPF1ApplyChangesForNegativeAuras();
   startIfResponsibleGM();
 });
 
@@ -83,9 +84,18 @@ Hooks.on("hoverToken", (token, hovered) => {
 
 Hooks.on("createMeasuredTemplate", () => window.setTimeout(() => updateHoverOnlyTemplateVisibility(), 50));
 
-Hooks.on("updateItem", (item, changed) => {
+Hooks.on("updateItem", async (item, changed) => {
   const aura = getAuraConfig(item);
   const copy = getAuraCopyConfig(item);
+
+  // Негативная аура не должна применять свои system.changes к источнику.
+  // Поэтому обычная PF1e-активность используется как триггер, а реальное
+  // состояние ауры хранится отдельно во flags: negativeAuraActive.
+  // Так изменения предмета остаются внутри эффекта и нормально копируются на цели.
+  if (aura?.isAura === true && aura?.isNegative === true && !copy && changed?.system?.active === true) {
+    await handleNegativeAuraActiveToggle(item, aura);
+    return;
+  }
 
   if (aura?.isAura || copy || changed?.system?.active !== undefined || changed?.flags?.[PPA.ID]) {
     queueTick();
@@ -126,7 +136,7 @@ Hooks.on("renderItemSheet", (app, html) => {
         try {
           injectAuraControlsIntoItemSheet(app, html);
         } catch (err) {
-          console.error("PF1e Auras: failed to inject item sheet controls", err);
+          console.error("Pathfinder 1e Auras: failed to inject item sheet controls", err);
         }
       }, delay);
     };
@@ -142,7 +152,7 @@ Hooks.on("renderItemSheet", (app, html) => {
         tryInject(180);
       });
   } catch (err) {
-    console.error("PF1e Auras: failed to prepare item sheet controls", err);
+    console.error("Pathfinder 1e Auras: failed to prepare item sheet controls", err);
   }
 });
 
@@ -179,7 +189,7 @@ function registerPublicApi() {
 }
 
 function debugLog(...args) {
-  if (game.settings.get(PPA.ID, "debug")) console.log("PF1e Auras:", ...args);
+  if (game.settings.get(PPA.ID, "debug")) console.log("Pathfinder 1e Auras:", ...args);
 }
 
 function registerSocketListener() {
@@ -196,7 +206,7 @@ function registerSocketListener() {
       debugLog("GM tick requested by socket", data.reason || "unknown");
     });
   } catch (err) {
-    console.warn("PF1e Auras: cannot register socket listener", err);
+    console.warn("Pathfinder 1e Auras: cannot register socket listener", err);
   }
 }
 
@@ -215,7 +225,7 @@ function requestGmTick(reason = "unknown", delay = 25) {
       sceneId: canvas?.scene?.id || null
     });
   } catch (err) {
-    console.warn("PF1e Auras: cannot request GM tick", err);
+    console.warn("Pathfinder 1e Auras: cannot request GM tick", err);
   }
 }
 
@@ -266,7 +276,7 @@ function getFlagWithLegacy(document, key) {
         const value = document.getFlag(scope, key);
         if (value !== undefined && value !== null) return value;
       } catch (err) {
-        console.warn("PF1e Auras: cannot read current flag scope", scope, err);
+        console.warn("Pathfinder 1e Auras: cannot read current flag scope", scope, err);
       }
     }
 
@@ -293,6 +303,35 @@ function getAuraConfig(item) {
 
 function getAuraCopyConfig(item) {
   return getFlagWithLegacy(item, PPA.FLAG_COPY);
+}
+
+async function handleNegativeAuraActiveToggle(item, cfg) {
+  try {
+    const currentlyAuraActive = cfg?.negativeAuraActive === true;
+    const nextAuraActive = !currentlyAuraActive;
+
+    const nextCfg = {
+      ...cfg,
+      negativeAuraActive: nextAuraActive
+    };
+
+    await item.setFlag(PPA.ID, PPA.FLAG_AURA, nextCfg);
+
+    // Важно: сам PF1e-эффект источника всегда остаётся неактивным,
+    // иначе PF1e применит его изменения к владельцу.
+    if (item.system?.active === true) {
+      await item.update({ "system.active": false });
+    }
+
+    ui.notifications.info(nextAuraActive
+      ? `Негативная аура «${item.name}» включена. Эффект не применяется к источнику.`
+      : `Негативная аура «${item.name}» выключена.`);
+
+    queueTick(10);
+    requestGmTick("negativeAuraActiveToggle", 50);
+  } catch (err) {
+    console.error("Pathfinder 1e Auras: failed to toggle negative aura active state", err);
+  }
 }
 
 function getTemplateFlag(templateDocument) {
@@ -325,6 +364,13 @@ function isAuraEnabledItem(item) {
   const cfg = getAuraConfig(item);
   if (!cfg?.isAura) return false;
   if (getAuraCopyConfig(item)) return false;
+
+  if (cfg?.isNegative === true) {
+    // Негативные ауры активируются отдельным флагом, чтобы исходный PF1e-эффект
+    // не применял свои изменения к источнику.
+    return cfg.negativeAuraActive === true;
+  }
+
   return item.system?.active === true;
 }
 
@@ -354,8 +400,10 @@ function injectAuraControlsIntoItemSheet(app, html) {
   const configured = isAura && cfg.configured === true;
 
   const hoverText = cfg.showOnHoverOnly ? " · только при наведении" : "";
+  const negativeText = cfg.isNegative ? " · негативный эффект" : "";
+  const negativeActiveText = cfg.isNegative ? ` · негативная аура ${cfg.negativeAuraActive ? "включена" : "выключена"}` : "";
   const summary = configured
-    ? `Радиус: ${Number(cfg.radiusFeet) || 10} футов · ${displayModeLabel(cfg.displayMode)}${hoverText}`
+    ? `Радиус: ${Number(cfg.radiusFeet) || 10} футов · ${displayModeLabel(cfg.displayMode)}${negativeText}${negativeActiveText}${hoverText}`
     : "Шаблон ещё не настроен.";
 
   const block = $(
@@ -366,6 +414,18 @@ function injectAuraControlsIntoItemSheet(app, html) {
           <input type="checkbox" class="pod-pyvo-is-aura" ${isAura ? "checked" : ""}/>
           Является аурой
         </label>
+      </div>
+      <div class="pod-pyvo-aura-row pod-pyvo-negative-row" style="display:${isAura ? "block" : "none"};">
+        <label>
+          <input type="checkbox" class="pod-pyvo-is-negative" ${cfg.isNegative ? "checked" : ""}/>
+          Негативный эффект
+        </label>
+        <p class="notes">Негативная аура передаётся вражеским командам вместо союзников. Исходный PF1e-эффект на источнике держится выключенным, чтобы его изменения не применялись к владельцу.</p>
+        <div class="pod-pyvo-negative-active-controls" style="display:${cfg.isNegative ? "block" : "none"}; margin-top: 6px;">
+          <button type="button" class="pod-pyvo-toggle-negative-active">
+            <i class="fas fa-power-off"></i> ${cfg.negativeAuraActive ? "Выключить негативную ауру" : "Включить негативную ауру"}
+          </button>
+        </div>
       </div>
       <div class="pod-pyvo-aura-configured" style="display:${configured ? "block" : "none"};">
         <button type="button" class="pod-pyvo-change-template"><i class="fas fa-drafting-compass"></i> Изменить шаблон</button>
@@ -393,11 +453,65 @@ function injectAuraControlsIntoItemSheet(app, html) {
     } else {
       // Полностью убираем настройку ауры. После этого кнопка
       // "Изменить шаблон" пропадёт, а повторное включение снова откроет настройку.
+      const oldCfg = getAuraConfig(item) || {};
+      await restoreNegativeSourceItem(item, oldCfg);
       await item.unsetFlag(PPA.ID, PPA.FLAG_AURA);
       app.render(false);
       queueTick(10);
       requestGmTick("auraUnconfigured", 50);
     }
+  });
+
+  block.find(".pod-pyvo-is-negative").on("change", async ev => {
+    const fresh = getAuraConfig(item) || {};
+    if (!fresh.isAura) {
+      ev.currentTarget.checked = false;
+      ui.notifications.warn("Сначала включи «Является аурой».");
+      return;
+    }
+
+    const checked = ev.currentTarget.checked === true;
+    const nextCfg = {
+      ...fresh,
+      isNegative: checked,
+      negativeAuraActive: checked ? (fresh.negativeAuraActive === true) : false
+    };
+
+    await item.setFlag(PPA.ID, PPA.FLAG_AURA, nextCfg);
+
+    if (!checked) await restoreNegativeSourceItem(item, fresh);
+
+    // Если эффект уже был активен как обычный PF1e-бафф и его переводят
+    // в негативную ауру, выключаем сам предмет и включаем ауру через флаг.
+    if (checked && item.system?.active === true) {
+      await item.setFlag(PPA.ID, PPA.FLAG_AURA, { ...nextCfg, negativeAuraActive: true });
+      await item.update({ "system.active": false });
+    }
+
+    app.render(false);
+    queueTick(10);
+    requestGmTick("negativeAuraChanged", 50);
+  });
+
+  block.find(".pod-pyvo-toggle-negative-active").on("click", async () => {
+    const fresh = getAuraConfig(item) || {};
+    if (!fresh.isAura || !fresh.isNegative) {
+      ui.notifications.warn("Сначала включи «Является аурой» и «Негативный эффект».");
+      return;
+    }
+
+    await item.setFlag(PPA.ID, PPA.FLAG_AURA, {
+      ...fresh,
+      negativeAuraActive: fresh.negativeAuraActive !== true
+    });
+
+    if (item.system?.active === true) {
+      await item.update({ "system.active": false });
+    }
+
+    app.render(false);
+    queueTick(10);
+    requestGmTick("negativeAuraActiveButton", 50);
   });
 
   block.find(".pod-pyvo-change-template").on("click", async () => {
@@ -617,15 +731,15 @@ function showAuraConfigDialog(item, oldConfig = {}) {
         </form>
       `,
       buttons: {
-        r10: { label: "10 футов", callback: html => resolve(readAuraDialog(html, 10)) },
-        r20: { label: "20 футов", callback: html => resolve(readAuraDialog(html, 20)) },
-        r30: { label: "30 футов", callback: html => resolve(readAuraDialog(html, 30)) },
-        r60: { label: "60 футов", callback: html => resolve(readAuraDialog(html, 60)) },
+        r10: { label: "10 футов", callback: html => resolve(readAuraDialog(html, 10, oldConfig)) },
+        r20: { label: "20 футов", callback: html => resolve(readAuraDialog(html, 20, oldConfig)) },
+        r30: { label: "30 футов", callback: html => resolve(readAuraDialog(html, 30, oldConfig)) },
+        r60: { label: "60 футов", callback: html => resolve(readAuraDialog(html, 60, oldConfig)) },
         custom: {
           label: "Своё",
           callback: html => {
             const value = Number(html.find('[name="radius"]').val());
-            resolve(readAuraDialog(html, Number.isFinite(value) && value > 0 ? value : defaultRadius));
+            resolve(readAuraDialog(html, Number.isFinite(value) && value > 0 ? value : defaultRadius, oldConfig));
           }
         }
       },
@@ -682,7 +796,7 @@ function bindPercentPair(html, rangeName, inputName, labelClass) {
   setValue(input.val());
 }
 
-function readAuraDialog(html, radiusFeet) {
+function readAuraDialog(html, radiusFeet, oldConfig = {}) {
   const displayMode = String(html.find('[name="displayMode"]').val() || "circle-cells");
   const outlineColor = String(html.find('[name="outlineColor"]').val() || game.user.color || "#00ffff");
   let outlineAlpha = percentToAlpha(html.find('[name="outlineAlphaPercent"]').val(), 0.85);
@@ -715,6 +829,9 @@ function readAuraDialog(html, radiusFeet) {
   return {
     isAura: true,
     configured: true,
+    isNegative: oldConfig.isNegative === true,
+    negativeAuraActive: oldConfig.negativeAuraActive === true,
+    selfSuppression: oldConfig.selfSuppression || null,
     radiusFeet,
     displayMode,
     showCells,
@@ -739,6 +856,10 @@ function getExplicitTeamId(token) {
 
 function isFriendlyToken(token) {
   return token?.document?.disposition === CONST.TOKEN_DISPOSITIONS.FRIENDLY;
+}
+
+function isHostileToken(token) {
+  return token?.document?.disposition === CONST.TOKEN_DISPOSITIONS.HOSTILE;
 }
 
 function isPlayerOwnedToken(token) {
@@ -794,18 +915,46 @@ function isTargetReceiver(token) {
   return isAutoPartyToken(token);
 }
 
-function canAuraAffectTarget(sourceToken, targetToken) {
+function isTargetReceiverForAura(token, cfg = {}) {
+  const role = getEffectiveRole(token);
+  if (role === "receiver" || role === "source-receiver") return true;
+  if (role === "source" || role === "none") return false;
+
+  if (cfg?.isNegative === true) {
+    // Для негативных аур авто-цели могут быть как партией, так и враждебными токенами.
+    // Если ГМ явно назначил токену команду, авто-роль тоже разрешает получать негативную ауру.
+    return !!getExplicitTeamId(token) || isAutoPartyToken(token) || isHostileToken(token);
+  }
+
+  return isAutoPartyToken(token);
+}
+
+function getNegativeRelationTeamId(token) {
+  const explicit = getExplicitTeamId(token);
+  if (explicit) return explicit;
+  if (isAutoPartyToken(token)) return "party";
+  if (isHostileToken(token)) return "hostile";
+  return null;
+}
+
+function canAuraAffectTarget(sourceToken, targetToken, cfg = {}) {
   if (!sourceToken || !targetToken) return false;
   if (sourceToken.id === targetToken.id) return false;
+  if (!isTargetReceiverForAura(targetToken, cfg)) return false;
+
+  if (cfg?.isNegative === true) {
+    const sourceTeam = getNegativeRelationTeamId(sourceToken);
+    const targetTeam = getNegativeRelationTeamId(targetToken);
+
+    if (!sourceTeam || !targetTeam) return false;
+    return sourceTeam !== targetTeam;
+  }
 
   const sourceTeam = getEffectiveTeamId(sourceToken);
   const targetTeam = getEffectiveTeamId(targetToken);
 
   if (!sourceTeam || !targetTeam) return false;
-  if (sourceTeam !== targetTeam) return false;
-  if (!isTargetReceiver(targetToken)) return false;
-
-  return true;
+  return sourceTeam === targetTeam;
 }
 
 function showTeamManagerDialog() {
@@ -960,6 +1109,112 @@ async function cleanupAuraScene() {
   ui.notifications.info("Командные ауры очищены на текущей сцене.");
 }
 
+
+function duplicateData(value) {
+  try {
+    if (foundry?.utils?.duplicate) return foundry.utils.duplicate(value);
+  } catch (_) {}
+  try {
+    return JSON.parse(JSON.stringify(value));
+  } catch (_) {
+    return value;
+  }
+}
+
+function shouldSuppressNegativeAuraOnSourceItem(item) {
+  const cfg = getAuraConfig(item);
+  if (!cfg?.isAura || cfg?.isNegative !== true) return false;
+  if (getAuraCopyConfig(item)) return false;
+  if (item.system?.active !== true) return false;
+  return true;
+}
+
+function patchPF1ApplyChangesForNegativeAuras() {
+  try {
+    const changesApi = globalThis.pf1?.documents?.actor?.changes;
+    if (!changesApi?.applyChanges || changesApi.applyChanges._pf1eAurasPatched) return;
+
+    const originalApplyChanges = changesApi.applyChanges;
+
+    const patchedApplyChanges = function(actor, options = {}) {
+      const suppressed = [];
+
+      try {
+        for (const item of actor?.items || []) {
+          if (!shouldSuppressNegativeAuraOnSourceItem(item)) continue;
+
+          const currentChanges = item.system?.changes;
+          if (!Array.isArray(currentChanges) || currentChanges.length === 0) continue;
+
+          suppressed.push({ item, changes: currentChanges });
+
+          // Важно: это только временная память на время подготовки данных актёра.
+          // Мы НЕ делаем item.update и НЕ удаляем изменения из настоящего предмета.
+          item.system.changes = [];
+        }
+
+        return originalApplyChanges.call(this, actor, options);
+      } finally {
+        for (const entry of suppressed) {
+          try {
+            entry.item.system.changes = entry.changes;
+          } catch (_) {}
+        }
+      }
+    };
+
+    patchedApplyChanges._pf1eAurasPatched = true;
+    patchedApplyChanges._pf1eAurasOriginal = originalApplyChanges;
+    changesApi.applyChanges = patchedApplyChanges;
+
+    console.log("Pathfinder 1e Auras: PF1 applyChanges patched for negative aura source suppression.");
+  } catch (err) {
+    console.warn("Pathfinder 1e Auras: cannot patch PF1 applyChanges; negative auras may still affect their source.", err);
+  }
+}
+
+async function restoreNegativeSourceItem(item, cfg = {}) {
+  const storedChanges = cfg?.selfSuppression?.systemChanges;
+  if (!storedChanges) return;
+
+  const currentChanges = duplicateData(item.system?.changes || []);
+  const hasCurrentChanges = Array.isArray(currentChanges) && currentChanges.length > 0;
+
+  const nextCfg = { ...cfg };
+  delete nextCfg.selfSuppression;
+
+  try {
+    // Миграция со старой версии 0.1.9: если она уже успела очистить изменения
+    // на источнике, возвращаем их один раз. В новых версиях изменения больше
+    // не удаляются из предмета вообще.
+    if (!hasCurrentChanges && Array.isArray(storedChanges)) {
+      await item.update({ "system.changes": duplicateData(storedChanges) });
+    }
+
+    await item.setFlag(PPA.ID, PPA.FLAG_AURA, nextCfg);
+  } catch (err) {
+    console.warn("Pathfinder 1e Auras: failed to restore negative aura source item", err);
+  }
+}
+
+function applyAuraSourceDataToCopy(itemData, cfg = {}) {
+  const storedChanges = cfg?.selfSuppression?.systemChanges;
+
+  // Совместимость с копиями из 0.1.9: если исходный предмет уже был случайно
+  // очищен старой версией, используем сохранённые изменения для копии.
+  if (cfg?.isNegative === true && Array.isArray(storedChanges)) {
+    const currentCopyChanges = itemData.system?.changes;
+    const copyHasChanges = Array.isArray(currentCopyChanges) && currentCopyChanges.length > 0;
+
+    if (!copyHasChanges) {
+      itemData.system = itemData.system || {};
+      itemData.system.changes = duplicateData(storedChanges);
+    }
+  }
+
+  return itemData;
+}
+
 async function tickAuras() {
   if (!isResponsibleGM()) return;
   if (!canvas?.scene || !canvas?.tokens) return;
@@ -975,6 +1230,7 @@ async function tickAuras() {
       for (const sourceItem of sourceToken.actor.items) {
         if (!isAuraEnabledItem(sourceItem)) {
           const cfg = getAuraConfig(sourceItem);
+          if (cfg?.selfSuppression) await restoreNegativeSourceItem(sourceItem, cfg);
           if (cfg?.templateId && cfg.sceneId === canvas.scene.id) {
             await deleteAuraTemplateById(cfg.templateId);
             await sourceItem.setFlag(PPA.ID, PPA.FLAG_AURA, { ...cfg, templateId: null });
@@ -982,7 +1238,11 @@ async function tickAuras() {
           continue;
         }
 
-        const cfg = getAuraConfig(sourceItem);
+        let cfg = getAuraConfig(sourceItem);
+        if (cfg?.selfSuppression) {
+          await restoreNegativeSourceItem(sourceItem, cfg);
+          cfg = getAuraConfig(sourceItem);
+        }
         const templateObject = await ensureAuraTemplate(sourceToken, sourceItem, cfg);
         const auraCellRects = getAuraCellRectsFromTemplate(templateObject);
         applyTemplateVisualMode(templateObject, cfg);
@@ -994,7 +1254,7 @@ async function tickAuras() {
     await cleanupOrphanAuraTemplates(activeAuras);
     await updateAuraCopies(tokens, activeAuras);
   } catch (err) {
-    console.error("PF1e Auras: aura tick failed", err);
+    console.error("Pathfinder 1e Auras: aura tick failed", err);
   } finally {
     PPA.running = false;
   }
@@ -1015,7 +1275,7 @@ async function updateAuraCopies(tokens, activeAuras) {
     const validAuras = [];
 
     for (const aura of activeAuras) {
-      if (!canAuraAffectTarget(aura.sourceToken, targetToken)) continue;
+      if (!canAuraAffectTarget(aura.sourceToken, targetToken, aura.cfg)) continue;
       if (!tokenTouchesAuraCellRects(aura.auraCellRects, targetToken)) continue;
       validAuras.push(aura);
     }
@@ -1040,6 +1300,7 @@ async function updateAuraCopies(tokens, activeAuras) {
       if (!existing) {
         let itemData = aura.sourceItem.toObject();
         delete itemData._id;
+        itemData = applyAuraSourceDataToCopy(itemData, aura.cfg);
         itemData = stripAuraSourceDataFromCopy(itemData);
         itemData.flags = itemData.flags || {};
         itemData.flags[PPA.ID] = itemData.flags[PPA.ID] || {};
@@ -1049,7 +1310,8 @@ async function updateAuraCopies(tokens, activeAuras) {
           sourceActorId: aura.sourceToken.actor.id,
           sourceItemId: aura.sourceItem.id,
           sourceItemName: aura.sourceItem.name,
-          teamId: getEffectiveTeamId(aura.sourceToken)
+          teamId: getEffectiveTeamId(aura.sourceToken),
+          isNegative: aura.cfg?.isNegative === true
         };
         itemData.name = `${aura.sourceItem.name}`;
         setProperty(itemData, "system.active", true);
@@ -1091,7 +1353,7 @@ async function deleteCopiedAuraItems(actor, items) {
     } catch (err) {
       const msg = String(err?.message || err || "");
       if (msg.includes("does not exist")) continue;
-      console.warn("PF1e Auras: cannot delete aura copy", id, err);
+      console.warn("Pathfinder 1e Auras: cannot delete aura copy", id, err);
     }
   }
 }
@@ -1140,7 +1402,7 @@ function updateHoverOnlyTemplateVisibility() {
     try {
       applyTemplateVisualMode(templateObject, cfg);
     } catch (err) {
-      console.warn("PF1e Auras: cannot update hover-only aura template visibility", err);
+      console.warn("Pathfinder 1e Auras: cannot update hover-only aura template visibility", err);
     }
   }
 }
@@ -1240,7 +1502,7 @@ async function safeDeleteMeasuredTemplates(ids) {
         }
       } catch (singleErr) {
         const msg = String(singleErr?.message || singleErr || "");
-        if (!msg.includes("does not exist")) console.warn("PF1e Auras: cannot delete template", id, singleErr);
+        if (!msg.includes("does not exist")) console.warn("Pathfinder 1e Auras: cannot delete template", id, singleErr);
       }
     }
   }
@@ -1408,7 +1670,7 @@ function getAuraCellRectsFromTemplate(templateObject) {
     try {
       rects = templateObject._getGridHighlightPositions().map(templatePositionToRect).filter(Boolean);
     } catch (err) {
-      console.warn("PF1e Auras: cannot read template cells", err);
+      console.warn("Pathfinder 1e Auras: cannot read template cells", err);
     }
   }
 
