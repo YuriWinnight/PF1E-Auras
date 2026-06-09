@@ -1,5 +1,5 @@
 /*
- * Pathfinder 1e Auras v0.1.11
+ * Pathfinder 1e Auras v0.1.12
  * Foundry VTT 11.315 / PF1e first playable version, negative aura source toggle decoupling patch.
  *
  * Основная идея:
@@ -20,7 +20,12 @@ const PPA = {
   visualStore: {
     circles: new Map()
   },
-  hoveredTokenIds: new Set()
+  hoveredTokenIds: new Set(),
+  tickRequestTimes: new Map(),
+  queuedTick: null,
+  queuedTickAt: 0,
+  pendingTick: false,
+  lastTickFinishedAt: 0
 };
 
 globalThis.PF1eAuras = PPA;
@@ -34,7 +39,7 @@ Hooks.once("init", () => {
     scope: "world",
     config: true,
     type: Number,
-    default: 100,
+    default: 250,
     range: {
       min: 50,
       max: 1000,
@@ -97,32 +102,44 @@ Hooks.on("updateItem", async (item, changed) => {
     return;
   }
 
-  if (aura?.isAura || copy || changed?.system?.active !== undefined || changed?.flags?.[PPA.ID]) {
+  if (aura?.isAura || changed?.flags?.[PPA.ID]) {
     queueTick();
-    requestGmTick("updateItem");
+    requestGmTick("updateItem", 25, 100);
+  } else if (copy) {
+    queueTick(100);
+    requestGmTick("updateAuraCopy", 150, 300);
   }
 });
 
 Hooks.on("updateActor", (actor, changed) => {
   // PF1e иногда обновляет состояние листа через актёра, а не через явный updateItem.
   // Просим активного ГМа пересчитать ауры после такого обновления.
-  if (changed?.items || changed?.system || changed?.flags) {
+  if (changed?.items || changed?.flags) {
     queueTick();
-    requestGmTick("updateActor");
+    requestGmTick("updateActor", 50, 150);
+  } else if (changed?.system) {
+    queueTick(250);
+    requestGmTick("updateActorSystem", 250, 500);
   }
 });
 
-Hooks.on("deleteItem", () => { queueTick(); requestGmTick("deleteItem"); });
-Hooks.on("updateToken", () => { queueTick(15); requestGmTick("updateToken", 50); });
-Hooks.on("refreshToken", () => queueTick(15));
+Hooks.on("deleteItem", item => {
+  if (!getAuraConfig(item) && !getAuraCopyConfig(item)) return;
+  queueTick();
+  requestGmTick("deleteItem", 25, 100);
+});
+Hooks.on("updateToken", (tokenDocument, changed) => {
+  if (!isTokenUpdateAuraRelevant(changed)) return;
+  queueTick(50);
+  requestGmTick("updateToken", 75, 150);
+});
 Hooks.on("createToken", () => { queueTick(15); requestGmTick("createToken", 50); });
 Hooks.on("deleteToken", () => { queueTick(15); requestGmTick("deleteToken", 50); });
 Hooks.on("updateMeasuredTemplate", () => {
-  queueTick();
   window.setTimeout(() => updateHoverOnlyTemplateVisibility(), 25);
 });
 Hooks.on("deleteMeasuredTemplate", templateDocument => {
-  queueTick();
+  if (getTemplateFlag(templateDocument)) queueTick(100);
   removeAuraVisual(templateDocument?.id);
   window.setTimeout(() => updateHoverOnlyTemplateVisibility(), 25);
 });
@@ -200,9 +217,12 @@ function registerSocketListener() {
 
       // Запускаем несколько пересчётов с маленькой задержкой: при клике игрока
       // данные Item/Actor могут прийти ГМу на долю секунды позже socket-сообщения.
+      const reason = String(data.reason || "unknown");
       queueTick(Number(data.delay ?? 25));
-      queueTick(150);
-      queueTick(350);
+      queueFollowUpTick(150);
+      if (reason !== "updateToken" && reason !== "updateActorSystem" && reason !== "updateAuraCopy") {
+        queueFollowUpTick(350);
+      }
       debugLog("GM tick requested by socket", data.reason || "unknown");
     });
   } catch (err) {
@@ -210,8 +230,17 @@ function registerSocketListener() {
   }
 }
 
-function requestGmTick(reason = "unknown", delay = 25) {
+function requestGmTick(reason = "unknown", delay = 25, throttleMs = 0) {
   try {
+    if (throttleMs > 0) {
+      const sceneId = canvas?.scene?.id || "no-scene";
+      const key = `${reason}:${sceneId}`;
+      const now = Date.now();
+      const last = PPA.tickRequestTimes.get(key) || 0;
+      if (now - last < throttleMs) return;
+      PPA.tickRequestTimes.set(key, now);
+    }
+
     if (isResponsibleGM()) {
       queueTick(delay);
       return;
@@ -243,7 +272,7 @@ function startEngine() {
   if (!isResponsibleGM()) return;
   if (PPA.intervalId) return;
 
-  const tickMs = Number(game.settings.get(PPA.ID, "tickMs")) || 250;
+  const tickMs = getConfiguredTickMs();
   PPA.intervalId = setInterval(() => tickAuras(), tickMs);
   debugLog("engine started", tickMs);
   tickAuras();
@@ -260,8 +289,50 @@ function stopEngine() {
 
 function queueTick(delay = 25) {
   if (!isResponsibleGM()) return;
+  if (PPA.running) {
+    PPA.pendingTick = true;
+    return;
+  }
+
+  const now = Date.now();
+  const numericDelay = Math.max(0, Number(delay) || 0);
+  const minGap = getMinTickGapMs();
+  const runAt = Math.max(now + numericDelay, (PPA.lastTickFinishedAt || 0) + minGap);
+
+  if (PPA.queuedTick && PPA.queuedTickAt && PPA.queuedTickAt <= runAt + 5) return;
+
   window.clearTimeout(PPA.queuedTick);
-  PPA.queuedTick = window.setTimeout(() => tickAuras(), delay);
+  PPA.queuedTickAt = runAt;
+  PPA.queuedTick = window.setTimeout(() => {
+    PPA.queuedTick = null;
+    PPA.queuedTickAt = 0;
+    tickAuras();
+  }, Math.max(0, runAt - Date.now()));
+}
+
+function queueFollowUpTick(delay = 150) {
+  if (!isResponsibleGM()) return;
+  window.setTimeout(() => queueTick(0), Math.max(0, Number(delay) || 0));
+}
+
+function getConfiguredTickMs(fallback = 250) {
+  try {
+    return Number(game.settings.get(PPA.ID, "tickMs")) || fallback;
+  } catch (_) {
+    return fallback;
+  }
+}
+
+function getMinTickGapMs() {
+  const configured = getConfiguredTickMs();
+  return Math.max(50, Math.min(250, configured));
+}
+
+function isTokenUpdateAuraRelevant(changed = {}) {
+  if (!changed || typeof changed !== "object") return true;
+  const directKeys = ["x", "y", "width", "height", "disposition", "actorId"];
+  if (directKeys.some(key => changed[key] !== undefined)) return true;
+  return changed.flags?.[PPA.ID] !== undefined;
 }
 
 function getFlagWithLegacy(document, key) {
@@ -1218,9 +1289,16 @@ function applyAuraSourceDataToCopy(itemData, cfg = {}) {
 async function tickAuras() {
   if (!isResponsibleGM()) return;
   if (!canvas?.scene || !canvas?.tokens) return;
-  if (PPA.running) return;
+  if (PPA.running) {
+    PPA.pendingTick = true;
+    return;
+  }
 
   PPA.running = true;
+  PPA.pendingTick = false;
+  window.clearTimeout(PPA.queuedTick);
+  PPA.queuedTick = null;
+  PPA.queuedTickAt = 0;
 
   try {
     const activeAuras = [];
@@ -1257,6 +1335,11 @@ async function tickAuras() {
     console.error("Pathfinder 1e Auras: aura tick failed", err);
   } finally {
     PPA.running = false;
+    PPA.lastTickFinishedAt = Date.now();
+    if (PPA.pendingTick) {
+      PPA.pendingTick = false;
+      queueTick(getMinTickGapMs());
+    }
   }
 }
 
@@ -1344,12 +1427,22 @@ function stripAuraSourceDataFromCopy(itemData) {
 async function deleteCopiedAuraItems(actor, items) {
   if (!actor || !items?.length) return;
   const ids = [...new Set(items.map(i => i?.id).filter(Boolean))];
+  if (!ids.length) return;
+
+  try {
+    await actor.deleteEmbeddedDocuments("Item", ids);
+    return;
+  } catch (err) {
+    const msg = String(err?.message || err || "");
+    if (!msg.includes("does not exist")) {
+      console.warn("Pathfinder 1e Auras: cannot batch delete aura copies; falling back to single deletes", err);
+    }
+  }
 
   for (const id of ids) {
     try {
       if (!actor.items.get(id)) continue;
       await actor.deleteEmbeddedDocuments("Item", [id]);
-      await sleep(10);
     } catch (err) {
       const msg = String(err?.message || err || "");
       if (msg.includes("does not exist")) continue;
@@ -1370,6 +1463,12 @@ function getTemplateConfigSnapshot(cfg = {}) {
     outlineAlpha: Math.max(0, Math.min(1, Number(cfg.outlineAlpha ?? cfg.borderAlpha ?? 0.85))),
     cellAlpha: Math.max(0, Math.min(1, Number(cfg.cellAlpha ?? cfg.fillAlpha ?? 0.35)))
   };
+}
+
+function templateConfigMatches(current = {}, expected = {}) {
+  const keys = Object.keys(expected);
+  if (!current || typeof current !== "object") return false;
+  return keys.every(key => current[key] === expected[key]);
 }
 
 function getTemplateVisualConfig(templateObject) {
@@ -1411,6 +1510,7 @@ async function ensureAuraTemplate(sourceToken, sourceItem, cfg) {
   let templateId = cfg.templateId || null;
   let templateObject = templateId ? canvas.templates.placeables.find(t => t.id === templateId) : null;
   const radiusFeet = Number(cfg.radiusFeet) || 10;
+  const desiredConfig = getTemplateConfigSnapshot(cfg);
 
   if (templateId && !templateObject) {
     await sourceItem.setFlag(PPA.ID, PPA.FLAG_AURA, { ...cfg, templateId: null });
@@ -1433,7 +1533,7 @@ async function ensureAuraTemplate(sourceToken, sourceItem, cfg) {
           sourceTokenId: sourceToken.id,
           sourceActorId: sourceToken.actor.id,
           sourceItemId: sourceItem.id,
-          config: getTemplateConfigSnapshot(cfg)
+          config: desiredConfig
         }
       }
     }]);
@@ -1455,11 +1555,12 @@ async function ensureAuraTemplate(sourceToken, sourceItem, cfg) {
   if (Number(templateObject.document.distance) !== radiusFeet) updates.distance = radiusFeet;
   if (templateObject.document.hidden !== false) updates.hidden = false;
   if (templateObject.document.fillColor !== (game.user.color || "#00ffff")) updates.fillColor = game.user.color || "#00ffff";
-  updates[`flags.${PPA.ID}.config`] = getTemplateConfigSnapshot(cfg);
-  updates[`flags.${PPA.ID}.sourceTokenId`] = sourceToken.id;
-  updates[`flags.${PPA.ID}.sourceActorId`] = sourceToken.actor.id;
-  updates[`flags.${PPA.ID}.sourceItemId`] = sourceItem.id;
-  updates[`flags.${PPA.ID}.template`] = true;
+  const currentFlag = templateObject.document.flags?.[PPA.ID] || {};
+  if (!templateConfigMatches(currentFlag.config, desiredConfig)) updates[`flags.${PPA.ID}.config`] = desiredConfig;
+  if (currentFlag.sourceTokenId !== sourceToken.id) updates[`flags.${PPA.ID}.sourceTokenId`] = sourceToken.id;
+  if (currentFlag.sourceActorId !== sourceToken.actor.id) updates[`flags.${PPA.ID}.sourceActorId`] = sourceToken.actor.id;
+  if (currentFlag.sourceItemId !== sourceItem.id) updates[`flags.${PPA.ID}.sourceItemId`] = sourceItem.id;
+  if (currentFlag.template !== true) updates[`flags.${PPA.ID}.template`] = true;
 
   if (Object.keys(updates).length) {
     await templateObject.document.update(updates);
