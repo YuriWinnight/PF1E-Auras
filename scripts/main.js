@@ -1,5 +1,5 @@
 /*
- * Pathfinder 1e Auras v0.1.12
+ * Pathfinder 1e Auras v0.1.16
  * Foundry VTT 11.315 / PF1e first playable version, negative aura source toggle decoupling patch.
  *
  * Основная идея:
@@ -25,7 +25,8 @@ const PPA = {
   queuedTick: null,
   queuedTickAt: 0,
   pendingTick: false,
-  lastTickFinishedAt: 0
+  lastTickFinishedAt: 0,
+  deletingTemplateIds: new Set()
 };
 
 globalThis.PF1eAuras = PPA;
@@ -134,7 +135,19 @@ Hooks.on("updateToken", (tokenDocument, changed) => {
   requestGmTick("updateToken", 75, 150);
 });
 Hooks.on("createToken", () => { queueTick(15); requestGmTick("createToken", 50); });
-Hooks.on("deleteToken", () => { queueTick(15); requestGmTick("deleteToken", 50); });
+Hooks.on("deleteToken", tokenDocument => {
+  const sourceIds = getDeletedTokenSourceIds(tokenDocument);
+  cleanupAurasForDeletedSource(sourceIds);
+  window.setTimeout(() => cleanupAurasForDeletedSource(sourceIds), 150);
+  queueTick(50);
+  requestGmTick("deleteToken", 75, 150);
+});
+Hooks.on("deleteActor", actor => {
+  const sourceIds = { sourceActorId: actor?.id, matchActorOnly: true };
+  cleanupAurasForDeletedSource(sourceIds);
+  window.setTimeout(() => cleanupAurasForDeletedSource(sourceIds), 150);
+  requestGmTick("deleteActor", 75, 150);
+});
 Hooks.on("updateMeasuredTemplate", () => {
   window.setTimeout(() => updateHoverOnlyTemplateVisibility(), 25);
 });
@@ -207,6 +220,13 @@ function registerPublicApi() {
 
 function debugLog(...args) {
   if (game.settings.get(PPA.ID, "debug")) console.log("Pathfinder 1e Auras:", ...args);
+}
+
+function isMissingEmbeddedDocumentError(err) {
+  const msg = String(err?.message || err || "");
+  return msg.includes("does not exist")
+    || msg.includes("EmbeddedCollectionDelta")
+    || msg.includes("undefined id");
 }
 
 function registerSocketListener() {
@@ -374,6 +394,18 @@ function getAuraConfig(item) {
 
 function getAuraCopyConfig(item) {
   return getFlagWithLegacy(item, PPA.FLAG_COPY);
+}
+
+async function safeSetAuraFlag(item, cfg) {
+  try {
+    await item?.setFlag?.(PPA.ID, PPA.FLAG_AURA, cfg);
+    return true;
+  } catch (err) {
+    if (!isMissingEmbeddedDocumentError(err)) {
+      console.warn("Pathfinder 1e Auras: cannot update aura flag", err);
+    }
+    return false;
+  }
 }
 
 async function handleNegativeAuraActiveToggle(item, cfg) {
@@ -925,12 +957,24 @@ function getExplicitTeamId(token) {
   return getTokenTeamData(token).teamId || null;
 }
 
+function getTokenDisposition(token) {
+  const value = token?.document?.disposition
+    ?? token?.document?._source?.disposition
+    ?? token?.data?.disposition
+    ?? token?.data?.data?.disposition
+    ?? null;
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : value;
+}
+
 function isFriendlyToken(token) {
-  return token?.document?.disposition === CONST.TOKEN_DISPOSITIONS.FRIENDLY;
+  const friendly = globalThis.CONST?.TOKEN_DISPOSITIONS?.FRIENDLY ?? 1;
+  return getTokenDisposition(token) === friendly;
 }
 
 function isHostileToken(token) {
-  return token?.document?.disposition === CONST.TOKEN_DISPOSITIONS.HOSTILE;
+  const hostile = globalThis.CONST?.TOKEN_DISPOSITIONS?.HOSTILE ?? -1;
+  return getTokenDisposition(token) === hostile;
 }
 
 function isPlayerOwnedToken(token) {
@@ -1003,8 +1047,8 @@ function isTargetReceiverForAura(token, cfg = {}) {
 function getNegativeRelationTeamId(token) {
   const explicit = getExplicitTeamId(token);
   if (explicit) return explicit;
-  if (isAutoPartyToken(token)) return "party";
   if (isHostileToken(token)) return "hostile";
+  if (isAutoPartyToken(token)) return "party";
   return null;
 }
 
@@ -1156,7 +1200,7 @@ function showCleanupDialog() {
 }
 
 async function cleanupAuraScene() {
-  if (!isResponsibleGM()) {
+  if (!game.user?.isGM) {
     ui.notifications.warn("Очистку должен выполнить активный ГМ.");
     return;
   }
@@ -1180,6 +1224,63 @@ async function cleanupAuraScene() {
   ui.notifications.info("Командные ауры очищены на текущей сцене.");
 }
 
+
+function getDeletedTokenSourceIds(tokenDocument) {
+  return {
+    sourceTokenId: tokenDocument?.id || tokenDocument?._id || null,
+    sourceActorId: tokenDocument?.actor?.id || tokenDocument?.actorId || null,
+    matchActorOnly: false
+  };
+}
+
+function auraSourceMatches(sourceData = {}, sourceIds = {}) {
+  const sourceTokenId = sourceIds.sourceTokenId || null;
+  const sourceActorId = sourceIds.sourceActorId || null;
+
+  if (sourceTokenId) return sourceData.sourceTokenId === sourceTokenId;
+  if (sourceIds.matchActorOnly === true && sourceActorId) return sourceData.sourceActorId === sourceActorId;
+  return false;
+}
+
+async function cleanupAurasForDeletedSource(sourceIds = {}) {
+  if (!isResponsibleGM()) return;
+  if (!canvas?.scene || !canvas?.templates || !canvas?.tokens) return;
+  if (!sourceIds.sourceTokenId && !sourceIds.sourceActorId) return;
+
+  try {
+    const auraTemplates = canvas.templates.placeables.filter(templateObject => {
+      const flag = getTemplateFlag(templateObject?.document);
+      if (!flag?.template) return false;
+      return auraSourceMatches(flag, sourceIds);
+    });
+
+    if (auraTemplates.length) {
+      await safeDeleteMeasuredTemplates(auraTemplates.map(t => t.id));
+    }
+
+    await deleteAuraCopiesForDeletedSource(sourceIds);
+  } catch (err) {
+    console.warn("Pathfinder 1e Auras: failed to clean deleted source auras", err);
+  }
+}
+
+async function deleteAuraCopiesForDeletedSource(sourceIds = {}) {
+  const seenActorIds = new Set();
+
+  for (const token of canvas.tokens.placeables || []) {
+    const actor = token?.actor;
+    if (!actor || seenActorIds.has(actor.id)) continue;
+    seenActorIds.add(actor.id);
+
+    const copies = actor.items.filter(item => {
+      const copy = getAuraCopyConfig(item);
+      if (!copy || copy.sceneId !== canvas.scene.id) return false;
+      return auraSourceMatches(copy, sourceIds);
+    });
+
+    await deleteCopiedAuraItems(actor, copies);
+  }
+}
 
 function duplicateData(value) {
   try {
@@ -1259,12 +1360,19 @@ async function restoreNegativeSourceItem(item, cfg = {}) {
     // на источнике, возвращаем их один раз. В новых версиях изменения больше
     // не удаляются из предмета вообще.
     if (!hasCurrentChanges && Array.isArray(storedChanges)) {
-      await item.update({ "system.changes": duplicateData(storedChanges) });
+      try {
+        await item.update({ "system.changes": duplicateData(storedChanges) });
+      } catch (err) {
+        if (!isMissingEmbeddedDocumentError(err)) throw err;
+        return;
+      }
     }
 
-    await item.setFlag(PPA.ID, PPA.FLAG_AURA, nextCfg);
+    await safeSetAuraFlag(item, nextCfg);
   } catch (err) {
-    console.warn("Pathfinder 1e Auras: failed to restore negative aura source item", err);
+    if (!isMissingEmbeddedDocumentError(err)) {
+      console.warn("Pathfinder 1e Auras: failed to restore negative aura source item", err);
+    }
   }
 }
 
@@ -1311,7 +1419,7 @@ async function tickAuras() {
           if (cfg?.selfSuppression) await restoreNegativeSourceItem(sourceItem, cfg);
           if (cfg?.templateId && cfg.sceneId === canvas.scene.id) {
             await deleteAuraTemplateById(cfg.templateId);
-            await sourceItem.setFlag(PPA.ID, PPA.FLAG_AURA, { ...cfg, templateId: null });
+            await safeSetAuraFlag(sourceItem, { ...cfg, templateId: null });
           }
           continue;
         }
@@ -1344,23 +1452,28 @@ async function tickAuras() {
 }
 
 async function updateAuraCopies(tokens, activeAuras) {
-  const actorTokens = [];
-  const seen = new Set();
+  const actorTokenGroups = new Map();
+
   for (const token of tokens) {
     if (!token.actor) continue;
-    if (seen.has(token.actor.id)) continue;
-    seen.add(token.actor.id);
-    actorTokens.push(token);
+    const actorId = token.actor.id || token.document?.actorId || token.id;
+    if (!actorTokenGroups.has(actorId)) actorTokenGroups.set(actorId, []);
+    actorTokenGroups.get(actorId).push(token);
   }
 
-  for (const targetToken of actorTokens) {
-    const actor = targetToken.actor;
+  for (const targetTokens of actorTokenGroups.values()) {
+    const actor = targetTokens[0]?.actor;
+    if (!actor) continue;
+
     const validAuras = [];
 
     for (const aura of activeAuras) {
-      if (!canAuraAffectTarget(aura.sourceToken, targetToken, aura.cfg)) continue;
-      if (!tokenTouchesAuraCellRects(aura.auraCellRects, targetToken)) continue;
-      validAuras.push(aura);
+      const affectsAnyToken = targetTokens.some(targetToken => {
+        if (!canAuraAffectTarget(aura.sourceToken, targetToken, aura.cfg)) return false;
+        return tokenTouchesAuraCellRects(aura.auraCellRects, targetToken);
+      });
+
+      if (affectsAnyToken) validAuras.push(aura);
     }
 
     const validKeys = new Set(validAuras.map(a => `${canvas.scene.id}:${a.sourceToken.id}:${a.sourceItem.id}`));
@@ -1429,25 +1542,34 @@ async function deleteCopiedAuraItems(actor, items) {
   const ids = [...new Set(items.map(i => i?.id).filter(Boolean))];
   if (!ids.length) return;
 
-  try {
-    await actor.deleteEmbeddedDocuments("Item", ids);
-    return;
-  } catch (err) {
-    const msg = String(err?.message || err || "");
-    if (!msg.includes("does not exist")) {
-      console.warn("Pathfinder 1e Auras: cannot batch delete aura copies; falling back to single deletes", err);
-    }
-  }
-
   for (const id of ids) {
     try {
-      if (!actor.items.get(id)) continue;
-      await actor.deleteEmbeddedDocuments("Item", [id]);
+      const item = getActorItem(actor, id);
+      if (!item) continue;
+
+      if (typeof item.delete === "function") {
+        await item.delete();
+      } else {
+        await actor.deleteEmbeddedDocuments("Item", [id]);
+      }
     } catch (err) {
-      const msg = String(err?.message || err || "");
-      if (msg.includes("does not exist")) continue;
+      if (isMissingEmbeddedDocumentError(err)) continue;
       console.warn("Pathfinder 1e Auras: cannot delete aura copy", id, err);
     }
+  }
+}
+
+function getActorItem(actor, id) {
+  if (!actor || !id || !actor.items) return null;
+
+  try {
+    return actor.items.get?.(id) || null;
+  } catch (_) {}
+
+  try {
+    return Array.from(actor.items || []).find(item => item?.id === id) || null;
+  } catch (_) {
+    return null;
   }
 }
 
@@ -1513,7 +1635,7 @@ async function ensureAuraTemplate(sourceToken, sourceItem, cfg) {
   const desiredConfig = getTemplateConfigSnapshot(cfg);
 
   if (templateId && !templateObject) {
-    await sourceItem.setFlag(PPA.ID, PPA.FLAG_AURA, { ...cfg, templateId: null });
+    await safeSetAuraFlag(sourceItem, { ...cfg, templateId: null });
     templateId = null;
   }
 
@@ -1539,7 +1661,7 @@ async function ensureAuraTemplate(sourceToken, sourceItem, cfg) {
     }]);
 
     templateId = created[0].id;
-    await sourceItem.setFlag(PPA.ID, PPA.FLAG_AURA, {
+    await safeSetAuraFlag(sourceItem, {
       ...cfg,
       templateId,
       sceneId: canvas.scene.id
@@ -1589,16 +1711,19 @@ async function cleanupOrphanAuraTemplates(activeAuras) {
 
 async function safeDeleteMeasuredTemplates(ids) {
   const unique = [...new Set((ids || []).filter(Boolean))];
-  const existing = unique.filter(id => canvas.scene?.templates?.get?.(id) || canvas.templates.placeables.some(t => t.id === id));
+  const pending = unique.filter(id => !PPA.deletingTemplateIds.has(id));
+  const existing = pending.filter(id => sceneHasMeasuredTemplate(id));
   for (const id of unique.filter(id => !existing.includes(id))) removeAuraVisual(id);
   if (!existing.length) return;
+
+  for (const id of existing) PPA.deletingTemplateIds.add(id);
 
   try {
     await canvas.scene.deleteEmbeddedDocuments("MeasuredTemplate", existing);
   } catch (err) {
     for (const id of existing) {
       try {
-        if (canvas.scene?.templates?.get?.(id) || canvas.templates.placeables.some(t => t.id === id)) {
+        if (sceneHasMeasuredTemplate(id)) {
           await canvas.scene.deleteEmbeddedDocuments("MeasuredTemplate", [id]);
         }
       } catch (singleErr) {
@@ -1606,9 +1731,25 @@ async function safeDeleteMeasuredTemplates(ids) {
         if (!msg.includes("does not exist")) console.warn("Pathfinder 1e Auras: cannot delete template", id, singleErr);
       }
     }
+  } finally {
+    for (const id of existing) PPA.deletingTemplateIds.delete(id);
   }
 
   for (const id of existing) removeAuraVisual(id);
+}
+
+function sceneHasMeasuredTemplate(id) {
+  if (!id || !canvas?.scene?.templates) return false;
+
+  try {
+    if (typeof canvas.scene.templates.has === "function") return canvas.scene.templates.has(id);
+  } catch (_) {}
+
+  try {
+    return !!canvas.scene.templates.get?.(id);
+  } catch (_) {
+    return false;
+  }
 }
 
 async function deleteAuraTemplateById(templateId) {
