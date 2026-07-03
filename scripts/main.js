@@ -1,5 +1,5 @@
 /*
- * Pathfinder 1e Auras v0.1.16
+ * Pathfinder 1e Auras v0.1.17
  * Foundry VTT 11.315 / PF1e first playable version, negative aura source toggle decoupling patch.
  *
  * Основная идея:
@@ -26,7 +26,8 @@ const PPA = {
   queuedTickAt: 0,
   pendingTick: false,
   lastTickFinishedAt: 0,
-  deletingTemplateIds: new Set()
+  deletingTemplateIds: new Set(),
+  creatingAuraCopyKeys: new Set()
 };
 
 globalThis.PF1eAuras = PPA;
@@ -77,6 +78,7 @@ Hooks.on("canvasReady", () => {
   startIfResponsibleGM();
   queueTick();
   window.setTimeout(() => updateHoverOnlyTemplateVisibility(), 100);
+  window.setTimeout(() => refreshLocalAuraActorEffects(), 250);
 });
 
 Hooks.on("hoverToken", (token, hovered) => {
@@ -150,6 +152,12 @@ Hooks.on("deleteActor", actor => {
 });
 Hooks.on("updateMeasuredTemplate", () => {
   window.setTimeout(() => updateHoverOnlyTemplateVisibility(), 25);
+});
+Hooks.on("refreshMeasuredTemplate", templateObject => {
+  const cfg = getTemplateVisualConfig(templateObject);
+  if (!cfg) return;
+  enforceAuraTemplateRuler(templateObject, cfg);
+  Promise.resolve().then(() => enforceAuraTemplateRuler(templateObject, cfg));
 });
 Hooks.on("deleteMeasuredTemplate", templateDocument => {
   if (getTemplateFlag(templateDocument)) queueTick(100);
@@ -232,7 +240,13 @@ function isMissingEmbeddedDocumentError(err) {
 function registerSocketListener() {
   try {
     game.socket?.on?.(`module.${PPA.ID}`, data => {
-      if (!data || data.type !== "requestTick") return;
+      if (!data) return;
+      if (data.type === "refreshAuraActorEffects") {
+        if (data.sceneId && data.sceneId !== canvas?.scene?.id) return;
+        refreshLocalAuraActorEffects(data.tokenIds);
+        return;
+      }
+      if (data.type !== "requestTick") return;
       if (!isResponsibleGM()) return;
 
       // Запускаем несколько пересчётов с маленькой задержкой: при клике игрока
@@ -1456,16 +1470,16 @@ async function updateAuraCopies(tokens, activeAuras) {
 
   for (const token of tokens) {
     if (!token.actor) continue;
-    const actorId = token.actor.id || token.document?.actorId || token.id;
-    if (!actorTokenGroups.has(actorId)) actorTokenGroups.set(actorId, []);
-    actorTokenGroups.get(actorId).push(token);
+    const actorKey = getAuraTargetActorKey(token);
+    if (!actorTokenGroups.has(actorKey)) actorTokenGroups.set(actorKey, []);
+    actorTokenGroups.get(actorKey).push(token);
   }
 
-  for (const targetTokens of actorTokenGroups.values()) {
+  for (const [actorKey, targetTokens] of actorTokenGroups.entries()) {
     const actor = targetTokens[0]?.actor;
     if (!actor) continue;
 
-    const validAuras = [];
+    const validAurasByKey = new Map();
 
     for (const aura of activeAuras) {
       const affectsAnyToken = targetTokens.some(targetToken => {
@@ -1473,58 +1487,106 @@ async function updateAuraCopies(tokens, activeAuras) {
         return tokenTouchesAuraCellRects(aura.auraCellRects, targetToken);
       });
 
-      if (affectsAnyToken) validAuras.push(aura);
+      if (affectsAnyToken) {
+        const key = getAuraSourceKey({
+          sceneId: canvas.scene.id,
+          sourceTokenId: aura.sourceToken.id,
+          sourceItemId: aura.sourceItem.id
+        });
+        if (!validAurasByKey.has(key)) validAurasByKey.set(key, aura);
+      }
     }
 
-    const validKeys = new Set(validAuras.map(a => `${canvas.scene.id}:${a.sourceToken.id}:${a.sourceItem.id}`));
-    const copies = actor.items.filter(i => getAuraCopyConfig(i));
-    const toDelete = copies.filter(i => {
-      const c = getAuraCopyConfig(i);
-      const key = `${c.sceneId}:${c.sourceTokenId}:${c.sourceItemId}`;
-      return !validKeys.has(key);
-    });
+    const copies = Array.from(actor.items || []).filter(i => getAuraCopyConfig(i));
+    const retainedCopies = new Map();
+    const toDelete = [];
+
+    for (const copyItem of copies) {
+      const copyKey = getAuraSourceKey(getAuraCopyConfig(copyItem));
+      if (!copyKey || !validAurasByKey.has(copyKey) || retainedCopies.has(copyKey)) {
+        toDelete.push(copyItem);
+        continue;
+      }
+      retainedCopies.set(copyKey, copyItem);
+    }
 
     await deleteCopiedAuraItems(actor, toDelete);
 
-    for (const aura of validAuras) {
-      const key = `${canvas.scene.id}:${aura.sourceToken.id}:${aura.sourceItem.id}`;
-      let existing = actor.items.find(i => {
-        const c = getAuraCopyConfig(i);
-        return c && `${c.sceneId}:${c.sourceTokenId}:${c.sourceItemId}` === key;
-      });
+    for (const [key, aura] of validAurasByKey.entries()) {
+      let existing = retainedCopies.get(key) || null;
 
       if (!existing) {
-        let itemData = aura.sourceItem.toObject();
-        delete itemData._id;
-        itemData = applyAuraSourceDataToCopy(itemData, aura.cfg);
-        itemData = stripAuraSourceDataFromCopy(itemData);
-        itemData.flags = itemData.flags || {};
-        itemData.flags[PPA.ID] = itemData.flags[PPA.ID] || {};
-        itemData.flags[PPA.ID][PPA.FLAG_COPY] = {
-          sceneId: canvas.scene.id,
-          sourceTokenId: aura.sourceToken.id,
-          sourceActorId: aura.sourceToken.actor.id,
-          sourceItemId: aura.sourceItem.id,
-          sourceItemName: aura.sourceItem.name,
-          teamId: getEffectiveTeamId(aura.sourceToken),
-          isNegative: aura.cfg?.isNegative === true
-        };
-        itemData.name = `${aura.sourceItem.name}`;
-        setProperty(itemData, "system.active", true);
+        const creationKey = `${actorKey}:${key}`;
+        if (PPA.creatingAuraCopyKeys.has(creationKey)) continue;
 
-        const created = await actor.createEmbeddedDocuments("Item", [itemData]);
-        existing = created[0];
-        debugLog("Aura copied", aura.sourceItem.name, "to", targetToken.name);
-      } else if (existing.system?.active !== true) {
-        await existing.update({ "system.active": true });
+        PPA.creatingAuraCopyKeys.add(creationKey);
+        try {
+          const concurrentExisting = Array.from(actor.items || []).find(item => {
+            return getAuraSourceKey(getAuraCopyConfig(item)) === key;
+          });
+
+          if (concurrentExisting) {
+            existing = concurrentExisting;
+          } else {
+            let itemData = aura.sourceItem.toObject();
+            delete itemData._id;
+            itemData = applyAuraSourceDataToCopy(itemData, aura.cfg);
+            itemData = stripAuraSourceDataFromCopy(itemData);
+            itemData.flags = itemData.flags || {};
+            itemData.flags[PPA.ID] = itemData.flags[PPA.ID] || {};
+            itemData.flags[PPA.ID][PPA.FLAG_COPY] = {
+              sceneId: canvas.scene.id,
+              sourceTokenId: aura.sourceToken.id,
+              sourceActorId: aura.sourceToken.actor.id,
+              sourceItemId: aura.sourceItem.id,
+              sourceItemName: aura.sourceItem.name,
+              teamId: getEffectiveTeamId(aura.sourceToken),
+              isNegative: aura.cfg?.isNegative === true
+            };
+            itemData.name = `${aura.sourceItem.name}`;
+            setProperty(itemData, "system.active", true);
+
+            const created = await actor.createEmbeddedDocuments("Item", [itemData]);
+            existing = created[0] || null;
+            debugLog("Aura copied", aura.sourceItem.name, "to", targetTokens[0]?.name || actor.name);
+          }
+        } finally {
+          PPA.creatingAuraCopyKeys.delete(creationKey);
+        }
+      }
+
+      if (existing?.system?.active !== true) {
+        try {
+          await existing.update({ "system.active": true });
+        } catch (err) {
+          if (!isMissingEmbeddedDocumentError(err)) throw err;
+          refreshActorAfterAuraCopyChange(actor);
+        }
       }
     }
   }
 }
 
+function getAuraTargetActorKey(token) {
+  const actor = token?.actor;
+  const isSynthetic = actor?.isToken === true || token?.document?.actorLink === false;
+  if (isSynthetic) return `token:${token?.id || actor?.uuid || actor?.id}`;
+  return `actor:${actor?.id || token?.document?.actorId || token?.id}`;
+}
+
+function getAuraSourceKey(copy = {}) {
+  const sceneId = copy?.sceneId;
+  const sourceTokenId = copy?.sourceTokenId;
+  const sourceItemId = copy?.sourceItemId;
+  if (!sceneId || !sourceTokenId || !sourceItemId) return null;
+  return `${sceneId}:${sourceTokenId}:${sourceItemId}`;
+}
+
 function stripAuraSourceDataFromCopy(itemData) {
-  if (itemData.flags?.[PPA.ID]) {
-    delete itemData.flags[PPA.ID][PPA.FLAG_AURA];
+  for (const scope of [PPA.ID, ...(PPA.LEGACY_IDS || [])]) {
+    if (itemData.flags?.[scope]) {
+      delete itemData.flags[scope][PPA.FLAG_AURA];
+    }
   }
 
   if (itemData.system) {
@@ -1556,6 +1618,69 @@ async function deleteCopiedAuraItems(actor, items) {
       if (isMissingEmbeddedDocumentError(err)) continue;
       console.warn("Pathfinder 1e Auras: cannot delete aura copy", id, err);
     }
+  }
+
+  refreshActorAfterAuraCopyChange(actor);
+}
+
+function refreshActorAfterAuraCopyChange(actor) {
+  try {
+    actor?.prepareData?.();
+  } catch (err) {
+    console.warn("Pathfinder 1e Auras: cannot refresh actor after aura cleanup", err);
+  }
+
+  try {
+    actor?.render?.(false);
+  } catch (_) {}
+
+  const tokenIds = getCanvasTokenIdsForActor(actor);
+  refreshLocalAuraActorEffects(tokenIds);
+
+  try {
+    game.socket?.emit?.(`module.${PPA.ID}`, {
+      type: "refreshAuraActorEffects",
+      sceneId: canvas?.scene?.id || null,
+      tokenIds
+    });
+  } catch (_) {}
+}
+
+function getCanvasTokenIdsForActor(actor) {
+  if (!actor || !canvas?.tokens?.placeables) return [];
+
+  return canvas.tokens.placeables
+    .filter(token => {
+      if (token?.actor === actor) return true;
+      if (actor.isToken === true || token?.actor?.isToken === true) return false;
+      return token?.actor?.id === actor.id;
+    })
+    .map(token => token.id)
+    .filter(Boolean);
+}
+
+function refreshLocalAuraActorEffects(tokenIds = null) {
+  if (!canvas?.tokens?.placeables) return;
+  const wantedIds = Array.isArray(tokenIds) ? new Set(tokenIds) : null;
+  const preparedActors = new Set();
+
+  for (const token of canvas.tokens.placeables) {
+    if (wantedIds && !wantedIds.has(token.id)) continue;
+    const actor = token?.actor;
+    const actorKey = getAuraTargetActorKey(token);
+
+    if (actor && !preparedActors.has(actorKey)) {
+      preparedActors.add(actorKey);
+      try {
+        actor.prepareData?.();
+        actor.render?.(false);
+      } catch (_) {}
+    }
+
+    try {
+      const drawing = token.drawEffects?.();
+      drawing?.catch?.(() => {});
+    } catch (_) {}
   }
 }
 
@@ -1838,11 +1963,7 @@ function applyTemplateVisualMode(templateObject, cfg) {
       templateObject.controlIcon.alpha = 0;
       templateObject.controlIcon.renderable = false;
     }
-    if (templateObject.ruler) {
-      templateObject.ruler.visible = false;
-      templateObject.ruler.alpha = 0;
-      templateObject.ruler.renderable = false;
-    }
+    enforceAuraTemplateRuler(templateObject, { ...cfg, showLabel: false });
 
     removeAuraVisual(templateObject.id);
     return;
@@ -1864,13 +1985,24 @@ function applyTemplateVisualMode(templateObject, cfg) {
     templateObject.controlIcon.alpha = 0;
     templateObject.controlIcon.renderable = false;
   }
-  if (templateObject.ruler) {
-    templateObject.ruler.visible = cfg.showLabel === true && displayMode !== "hidden";
-    templateObject.ruler.alpha = templateObject.ruler.visible ? 1 : 0;
-    templateObject.ruler.renderable = templateObject.ruler.visible;
-  }
+  enforceAuraTemplateRuler(templateObject, cfg);
 
   updateAuraVisualCircle(templateObject, cfg);
+}
+
+function enforceAuraTemplateRuler(templateObject, cfg = {}) {
+  const ruler = templateObject?.ruler;
+  if (!ruler) return;
+
+  const displayMode = cfg.displayMode || "circle-cells";
+  const visible = cfg.showLabel === true && displayMode !== "hidden" && isAuraTemplateHoverVisible(templateObject, cfg);
+  const radiusFeet = Number(cfg.radiusFeet) || Number(templateObject.document?.distance) || 10;
+  const units = canvas.scene?.grid?.units || "ft";
+
+  if (visible && "text" in ruler) ruler.text = `${radiusFeet} ${units}`;
+  ruler.visible = visible;
+  ruler.alpha = visible ? 1 : 0;
+  ruler.renderable = visible;
 }
 
 function forceHideHighlightLayer(layer, clearGraphics = false) {
