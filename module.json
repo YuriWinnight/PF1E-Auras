@@ -1,8 +1,8 @@
 {
     "id":  "pf1e-auras",
     "title":  "Pathfinder 1e Auras",
-    "description":  "РђРІС‚РѕРјР°С‚РёС‡РµСЃРєРёРµ РєРѕРјР°РЅРґРЅС‹Рµ Р°СѓСЂС‹ РґР»СЏ Pathfinder 1e РЅР° Foundry VTT 11.",
-    "version":  "0.1.18",
+    "description":  "Р С’Р Р†РЎвЂљР С•Р СР В°РЎвЂљР С‘РЎвЂЎР ВµРЎРѓР С”Р С‘Р Вµ Р С”Р С•Р СР В°Р Р…Р Т‘Р Р…РЎвЂ№Р Вµ Р В°РЎС“РЎР‚РЎвЂ№ Р Т‘Р В»РЎРЏ Pathfinder 1e Р Р…Р В° Foundry VTT 11.",
+    "version":  "0.1.19",
     "authors":  [
                     {
                         "name":  "Yuri + ChatGPT"
@@ -25,11 +25,11 @@
     "languages":  [
                       {
                           "lang":  "ru",
-                          "name":  "Р СѓСЃСЃРєРёР№",
+                          "name":  "Р В РЎС“РЎРѓРЎРѓР С”Р С‘Р в„–",
                           "path":  "lang/ru.json"
                       }
                   ],
     "url":  "https://github.com/YuriWinnight/PF1E-Auras",
     "manifest":  "https://github.com/YuriWinnight/PF1E-Auras/releases/latest/download/module.json",
-    "download":  "https://github.com/YuriWinnight/PF1E-Auras/releases/download/v0.1.18/pf1e-auras-v0.1.18.zip"
+    "download":  "https://github.com/YuriWinnight/PF1E-Auras/releases/download/v0.1.19/pf1e-auras-v0.1.19.zip"
 }
