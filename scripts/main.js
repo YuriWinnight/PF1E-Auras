@@ -1,5 +1,5 @@
 /*
- * Pathfinder 1e Auras v0.1.17
+ * Pathfinder 1e Auras v0.1.18
  * Foundry VTT 11.315 / PF1e first playable version, negative aura source toggle decoupling patch.
  *
  * Основная идея:
@@ -27,7 +27,8 @@ const PPA = {
   pendingTick: false,
   lastTickFinishedAt: 0,
   deletingTemplateIds: new Set(),
-  creatingAuraCopyKeys: new Set()
+  creatingAuraCopyKeys: new Set(),
+  templateVisualTimers: new Map()
 };
 
 globalThis.PF1eAuras = PPA;
@@ -90,7 +91,13 @@ Hooks.on("hoverToken", (token, hovered) => {
   updateHoverOnlyTemplateVisibility();
 });
 
-Hooks.on("createMeasuredTemplate", () => window.setTimeout(() => updateHoverOnlyTemplateVisibility(), 50));
+Hooks.on("createMeasuredTemplate", templateDocument => {
+  window.setTimeout(() => {
+    updateHoverOnlyTemplateVisibility();
+    enforceAuraTemplateVisualsById(templateDocument?.id);
+  }, 50);
+  window.setTimeout(() => enforceAuraTemplateVisualsById(templateDocument?.id), 250);
+});
 
 Hooks.on("updateItem", async (item, changed) => {
   const aura = getAuraConfig(item);
@@ -151,13 +158,18 @@ Hooks.on("deleteActor", actor => {
   requestGmTick("deleteActor", 75, 150);
 });
 Hooks.on("updateMeasuredTemplate", () => {
-  window.setTimeout(() => updateHoverOnlyTemplateVisibility(), 25);
+  window.setTimeout(() => {
+    updateHoverOnlyTemplateVisibility();
+    for (const templateObject of canvas?.templates?.placeables || []) {
+      if (getTemplateFlag(templateObject?.document)) enforceAuraTemplateVisualsById(templateObject.id);
+    }
+  }, 25);
 });
 Hooks.on("refreshMeasuredTemplate", templateObject => {
   const cfg = getTemplateVisualConfig(templateObject);
   if (!cfg) return;
-  enforceAuraTemplateRuler(templateObject, cfg);
-  Promise.resolve().then(() => enforceAuraTemplateRuler(templateObject, cfg));
+  enforceAuraTemplateVisuals(templateObject, cfg);
+  scheduleAuraTemplateVisualEnforcement(templateObject, cfg);
 });
 Hooks.on("deleteMeasuredTemplate", templateDocument => {
   if (getTemplateFlag(templateDocument)) queueTick(100);
@@ -785,7 +797,6 @@ function showAuraConfigDialog(item, oldConfig = {}) {
   const defaultOutlineColor = oldConfig.outlineColor || oldConfig.circleColor || game.user.color || "#00ffff";
   const defaultCellPercent = alphaToPercent(oldConfig.cellAlpha ?? oldConfig.fillAlpha, 35);
   const defaultOutlinePercent = alphaToPercent(oldConfig.outlineAlpha ?? oldConfig.borderAlpha, 85);
-  const defaultShowLabel = oldConfig.showLabel === true;
   const defaultShowOnHoverOnly = oldConfig.showOnHoverOnly === true;
 
   return new Promise(resolve => {
@@ -831,12 +842,6 @@ function showAuraConfigDialog(item, oldConfig = {}) {
               <p class="notes">0 — клетки не видны. 100 — клетки максимально заметны. Цвет берётся из цвета активного ГМа.</p>
             </div>
           </div>
-          <div class="form-group pod-pyvo-label-field">
-            <label>
-              <input type="checkbox" name="showLabel" ${defaultShowLabel ? "checked" : ""}/>
-              Показывать подпись Foundry, если она доступна
-            </label>
-          </div>
           <div class="form-group">
             <label>
               <input type="checkbox" name="showOnHoverOnly" ${defaultShowOnHoverOnly ? "checked" : ""}/>
@@ -874,7 +879,6 @@ function showAuraConfigDialog(item, oldConfig = {}) {
           const mode = String(html.find('[name="displayMode"]').val() || "circle-cells");
           html.find(".pod-pyvo-outline-field").toggle(mode === "circle" || mode === "circle-cells");
           html.find(".pod-pyvo-cell-field").toggle(mode === "cells" || mode === "circle-cells");
-          html.find(".pod-pyvo-label-field").toggle(mode !== "hidden");
 
           const hint = mode === "hidden"
             ? "Скрытый режим: ничего не отображается, но расчёт ауры работает."
@@ -921,13 +925,11 @@ function readAuraDialog(html, radiusFeet, oldConfig = {}) {
 
   let showCells = false;
   let showCircle = false;
-  let showLabel = html.find('[name="showLabel"]')[0]?.checked === true;
   const showOnHoverOnly = html.find('[name="showOnHoverOnly"]')[0]?.checked === true;
 
   if (displayMode === "hidden") {
     showCells = false;
     showCircle = false;
-    showLabel = false;
     cellAlpha = 0;
     outlineAlpha = 0;
   } else if (displayMode === "circle") {
@@ -953,7 +955,7 @@ function readAuraDialog(html, radiusFeet, oldConfig = {}) {
     displayMode,
     showCells,
     showCircle,
-    showLabel,
+    showLabel: false,
     showOnHoverOnly,
     outlineColor,
     outlineAlpha,
@@ -1704,7 +1706,7 @@ function getTemplateConfigSnapshot(cfg = {}) {
     displayMode: cfg.displayMode || "circle-cells",
     showCells: cfg.showCells === true,
     showCircle: cfg.showCircle === true,
-    showLabel: cfg.showLabel === true,
+    showLabel: false,
     showOnHoverOnly: cfg.showOnHoverOnly === true,
     outlineColor: cfg.outlineColor || cfg.circleColor || game.user?.color || "#00ffff",
     outlineAlpha: Math.max(0, Math.min(1, Number(cfg.outlineAlpha ?? cfg.borderAlpha ?? 0.85))),
@@ -1781,6 +1783,9 @@ async function ensureAuraTemplate(sourceToken, sourceItem, cfg) {
           sourceActorId: sourceToken.actor.id,
           sourceItemId: sourceItem.id,
           config: desiredConfig
+        },
+        levels: {
+          elevation: 0
         }
       }
     }]);
@@ -1808,6 +1813,7 @@ async function ensureAuraTemplate(sourceToken, sourceItem, cfg) {
   if (currentFlag.sourceActorId !== sourceToken.actor.id) updates[`flags.${PPA.ID}.sourceActorId`] = sourceToken.actor.id;
   if (currentFlag.sourceItemId !== sourceItem.id) updates[`flags.${PPA.ID}.sourceItemId`] = sourceItem.id;
   if (currentFlag.template !== true) updates[`flags.${PPA.ID}.template`] = true;
+  Object.assign(updates, getAuraTemplateElevationResetUpdates(templateObject.document));
 
   if (Object.keys(updates).length) {
     await templateObject.document.update(updates);
@@ -1815,6 +1821,8 @@ async function ensureAuraTemplate(sourceToken, sourceItem, cfg) {
   }
 
   templateObject.refresh?.();
+  enforceAuraTemplateVisuals(templateObject, desiredConfig);
+  scheduleAuraTemplateVisualEnforcement(templateObject, desiredConfig);
   return templateObject;
 }
 
@@ -1898,10 +1906,17 @@ function getAuraLayerContainer() {
 
 function removeAuraVisual(templateId) {
   if (!templateId) return;
+  clearAuraTemplateVisualTimers(templateId);
   const store = getAuraVisualStore();
   const entry = store.circles.get(templateId);
   if (entry?.graphic) entry.graphic.destroy({ children: true });
   store.circles.delete(templateId);
+}
+
+function clearAuraTemplateVisualTimers(templateId) {
+  const timers = PPA.templateVisualTimers.get(templateId) || [];
+  for (const timerId of timers) window.clearTimeout(timerId);
+  PPA.templateVisualTimers.delete(templateId);
 }
 
 function updateAuraVisualCircle(templateObject, cfg) {
@@ -1963,7 +1978,7 @@ function applyTemplateVisualMode(templateObject, cfg) {
       templateObject.controlIcon.alpha = 0;
       templateObject.controlIcon.renderable = false;
     }
-    enforceAuraTemplateRuler(templateObject, { ...cfg, showLabel: false });
+    enforceAuraTemplateVisuals(templateObject, { ...cfg, showLabel: false });
 
     removeAuraVisual(templateObject.id);
     return;
@@ -1985,24 +2000,110 @@ function applyTemplateVisualMode(templateObject, cfg) {
     templateObject.controlIcon.alpha = 0;
     templateObject.controlIcon.renderable = false;
   }
-  enforceAuraTemplateRuler(templateObject, cfg);
+  enforceAuraTemplateVisuals(templateObject, cfg);
 
   updateAuraVisualCircle(templateObject, cfg);
+}
+
+function enforceAuraTemplateVisualsById(templateId) {
+  const templateObject = getCanvasTemplateObject(templateId);
+  const cfg = getTemplateVisualConfig(templateObject);
+  if (!templateObject || !cfg) return;
+  enforceAuraTemplateVisuals(templateObject, cfg);
+}
+
+function getCanvasTemplateObject(templateId) {
+  if (!templateId || !canvas?.templates?.placeables) return null;
+  return canvas.templates.placeables.find(t => t.id === templateId) || null;
+}
+
+function scheduleAuraTemplateVisualEnforcement(templateObject, cfg = null) {
+  if (!templateObject?.id) return;
+
+  const templateId = templateObject.id;
+  const oldTimers = PPA.templateVisualTimers.get(templateId) || [];
+  for (const timerId of oldTimers) window.clearTimeout(timerId);
+
+  const delays = [0, 50, 250];
+  const timers = delays.map(delay => window.setTimeout(() => {
+    const freshTemplateObject = getCanvasTemplateObject(templateId);
+    const freshCfg = getTemplateVisualConfig(freshTemplateObject) || cfg;
+    if (freshTemplateObject && freshCfg) enforceAuraTemplateVisuals(freshTemplateObject, freshCfg);
+    if (delay === delays[delays.length - 1] && PPA.templateVisualTimers.get(templateId) === timers) {
+      PPA.templateVisualTimers.delete(templateId);
+    }
+  }, delay));
+
+  PPA.templateVisualTimers.set(templateId, timers);
+}
+
+function enforceAuraTemplateVisuals(templateObject, cfg = {}) {
+  removeLevelsTemplateTooltip(templateObject);
+  hideAuraTemplateText(templateObject);
+  enforceAuraTemplateRuler(templateObject, cfg);
+}
+
+function getAuraTemplateElevationResetUpdates(templateDocument) {
+  const updates = {};
+  if (!templateDocument) return updates;
+
+  const levelsElevation = templateDocument.getFlag?.("levels", "elevation") ?? templateDocument.flags?.levels?.elevation;
+  if (levelsElevation !== 0) updates["flags.levels.elevation"] = 0;
+
+  const coreElevation = Number(templateDocument.elevation);
+  if (Number.isFinite(coreElevation) && coreElevation !== 0) updates.elevation = 0;
+
+  return updates;
+}
+
+function removeLevelsTemplateTooltip(templateObject) {
+  const tooltip = templateObject?.tooltip;
+  if (!tooltip || tooltip.destroyed) {
+    if (templateObject) templateObject.tooltip = null;
+    return;
+  }
+
+  try {
+    tooltip.visible = false;
+    tooltip.alpha = 0;
+    tooltip.renderable = false;
+    if (tooltip.parent?.removeChild) tooltip.parent.removeChild(tooltip);
+    tooltip.destroy?.({ children: true });
+  } catch (err) {
+    console.warn("Pathfinder 1e Auras: cannot remove Levels template elevation tooltip", err);
+  } finally {
+    templateObject.tooltip = null;
+  }
+}
+
+function hideAuraTemplateText(templateObject) {
+  walkPixiTree(templateObject, child => {
+    if (!child || child === templateObject?.ruler) return;
+    if (typeof child.text !== "string") return;
+    child.visible = false;
+    child.alpha = 0;
+    child.renderable = false;
+  });
+}
+
+function walkPixiTree(root, callback, seen = new Set()) {
+  if (!root || typeof root !== "object" || seen.has(root)) return;
+  seen.add(root);
+  callback(root);
+
+  for (const child of root.children || []) {
+    walkPixiTree(child, callback, seen);
+  }
 }
 
 function enforceAuraTemplateRuler(templateObject, cfg = {}) {
   const ruler = templateObject?.ruler;
   if (!ruler) return;
 
-  const displayMode = cfg.displayMode || "circle-cells";
-  const visible = cfg.showLabel === true && displayMode !== "hidden" && isAuraTemplateHoverVisible(templateObject, cfg);
-  const radiusFeet = Number(cfg.radiusFeet) || Number(templateObject.document?.distance) || 10;
-  const units = canvas.scene?.grid?.units || "ft";
-
-  if (visible && "text" in ruler) ruler.text = `${radiusFeet} ${units}`;
-  ruler.visible = visible;
-  ruler.alpha = visible ? 1 : 0;
-  ruler.renderable = visible;
+  if ("text" in ruler) ruler.text = "";
+  ruler.visible = false;
+  ruler.alpha = 0;
+  ruler.renderable = false;
 }
 
 function forceHideHighlightLayer(layer, clearGraphics = false) {
