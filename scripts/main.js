@@ -1,5 +1,5 @@
 /*
- * Pathfinder 1e Auras v0.1.18
+ * Pathfinder 1e Auras v0.1.19
  * Foundry VTT 11.315 / PF1e first playable version, negative aura source toggle decoupling patch.
  *
  * Основная идея:
@@ -14,6 +14,7 @@ const PPA = {
   LEGACY_IDS: ["PF1e-Auras", "pod-pyvo-auras"],
   FLAG_AURA: "aura",
   FLAG_COPY: "copy",
+  FLAG_EFFECT: "effect",
   FLAG_TEAM: "team",
   intervalId: null,
   running: false,
@@ -28,6 +29,7 @@ const PPA = {
   lastTickFinishedAt: 0,
   deletingTemplateIds: new Set(),
   creatingAuraCopyKeys: new Set(),
+  reconcilingAuraEffectActors: new Set(),
   templateVisualTimers: new Map()
 };
 
@@ -134,9 +136,25 @@ Hooks.on("updateActor", (actor, changed) => {
 });
 
 Hooks.on("deleteItem", item => {
-  if (!getAuraConfig(item) && !getAuraCopyConfig(item)) return;
+  const aura = getAuraConfig(item);
+  const copy = getAuraCopyConfig(item);
+  if (!aura && !copy) return;
+
+  if (copy && isResponsibleGM() && item?.actor && item?.id) {
+    const actor = item.actor;
+    const itemId = item.id;
+    window.setTimeout(() => cleanupAuraActiveEffectsForItemIds(actor, [itemId]), 25);
+    window.setTimeout(() => cleanupAuraActiveEffectsForItemIds(actor, [itemId]), 150);
+  }
+
   queueTick();
   requestGmTick("deleteItem", 25, 100);
+});
+Hooks.on("createActiveEffect", effect => {
+  if (!isResponsibleGM() || !effect?.actor) return;
+  const actor = effect.actor;
+  window.setTimeout(() => reconcileAuraActorActiveEffects(actor), 25);
+  window.setTimeout(() => reconcileAuraActorActiveEffects(actor), 150);
 });
 Hooks.on("updateToken", (tokenDocument, changed) => {
   if (!isTokenUpdateAuraRelevant(changed)) return;
@@ -227,6 +245,15 @@ Hooks.on("getSceneControlButtons", controls => {
     visible: game.user.isGM,
     onClick: () => showCleanupDialog()
   });
+
+  tokenControls.tools.push({
+    name: "pod-pyvo-aura-token-effect-cleanup",
+    title: "Полностью очистить эффекты выбранных токенов",
+    icon: "fas fa-eraser",
+    button: true,
+    visible: game.user.isGM,
+    onClick: () => showTokenEffectCleanupDialog()
+  });
 });
 
 function registerPublicApi() {
@@ -235,6 +262,7 @@ function registerPublicApi() {
   PPA.tick = tickAuras;
   PPA.openTeamManager = showTeamManagerDialog;
   PPA.cleanup = cleanupAuraScene;
+  PPA.purgeSelectedTokenEffects = purgeSelectedTokenEffects;
   PPA.configureItemAura = configureItemAura;
 }
 
@@ -1215,6 +1243,84 @@ function showCleanupDialog() {
   }).render(true);
 }
 
+function showTokenEffectCleanupDialog() {
+  const selected = Array.from(canvas?.tokens?.controlled || []).filter(token => token?.actor);
+  if (!selected.length) {
+    ui.notifications.warn("Сначала выберите хотя бы один токен.");
+    return;
+  }
+
+  const tokenIds = selected.map(token => token.id).filter(Boolean);
+  new Dialog({
+    title: "Полная очистка эффектов токена",
+    content: `
+      <p>Выбрано токенов: <strong>${tokenIds.length}</strong>.</p>
+      <p>Будут удалены все ActiveEffect, включая скрытые и осиротевшие, отключены активные бафы и ауры, а также удалены служебные копии аур. Оригинальные предметы актёра останутся.</p>
+      <p><strong>Для связанных токенов очистится общий актёр.</strong></p>
+      <p>Если токен остаётся внутри чужой активной ауры, один корректный эффект этой ауры применится снова.</p>
+    `,
+    buttons: {
+      cleanup: {
+        label: "Очистить эффекты",
+        callback: async () => purgeSelectedTokenEffects(tokenIds)
+      },
+      cancel: { label: "Отмена" }
+    },
+    default: "cancel"
+  }).render(true);
+}
+
+async function purgeSelectedTokenEffects(tokenIds = null) {
+  if (!game.user?.isGM) {
+    ui.notifications.warn("Полную очистку эффектов должен выполнить ГМ.");
+    return;
+  }
+
+  const wantedIds = Array.isArray(tokenIds) ? new Set(tokenIds) : null;
+  const selected = Array.from(canvas?.tokens?.placeables || []).filter(token => {
+    if (!token?.actor) return false;
+    if (wantedIds) return wantedIds.has(token.id);
+    return token.controlled === true;
+  });
+
+  if (!selected.length) {
+    ui.notifications.warn("Не найдены выбранные токены с актёрами.");
+    return;
+  }
+
+  const actorGroups = new Map();
+  for (const token of selected) {
+    const actorKey = getAuraTargetActorKey(token);
+    if (!actorGroups.has(actorKey)) actorGroups.set(actorKey, token.actor);
+  }
+
+  let removedEffects = 0;
+  let removedAuraCopies = 0;
+  let disabledItems = 0;
+
+  for (const actor of actorGroups.values()) {
+    const copies = Array.from(actor.items || []).filter(item => getAuraCopyConfig(item));
+    removedAuraCopies += copies.length;
+    await deleteCopiedAuraItems(actor, copies);
+
+    disabledItems += await disableActorEffectItems(actor);
+    removedEffects += await safeDeleteActorActiveEffects(actor, Array.from(actor.effects || []));
+    await clearActorConditions(actor);
+
+    // PF1e запускает синхронизацию иконок без await. Второй проход ловит эффект,
+    // который мог успеть создаться сразу после первого удаления.
+    await new Promise(resolve => window.setTimeout(resolve, 100));
+    removedEffects += await safeDeleteActorActiveEffects(actor, Array.from(actor.effects || []));
+    refreshActorAfterAuraCopyChange(actor);
+  }
+
+  queueTick(50);
+  requestGmTick("purgeSelectedTokenEffects", 75, 150);
+  ui.notifications.info(
+    `Эффекты очищены: ${removedEffects}; отключено предметов: ${disabledItems}; удалено копий аур: ${removedAuraCopies}.`
+  );
+}
+
 async function cleanupAuraScene() {
   if (!game.user?.isGM) {
     ui.notifications.warn("Очистку должен выполнить активный ГМ.");
@@ -1226,10 +1332,17 @@ async function cleanupAuraScene() {
     await safeDeleteMeasuredTemplates(auraTemplates.map(t => t.id));
   }
 
+  const auraEffectCatalog = getKnownAuraEffectCatalog();
+  const cleanedActorKeys = new Set();
   for (const token of canvas.tokens.placeables) {
     if (!token.actor) continue;
+    const actorKey = getAuraTargetActorKey(token);
+    if (cleanedActorKeys.has(actorKey)) continue;
+    cleanedActorKeys.add(actorKey);
+
     const copies = token.actor.items.filter(i => getAuraCopyConfig(i));
     await deleteCopiedAuraItems(token.actor, copies);
+    await reconcileAuraActorActiveEffects(token.actor, auraEffectCatalog);
   }
 
   for (const entry of PPA.visualStore.circles.values()) {
@@ -1281,12 +1394,13 @@ async function cleanupAurasForDeletedSource(sourceIds = {}) {
 }
 
 async function deleteAuraCopiesForDeletedSource(sourceIds = {}) {
-  const seenActorIds = new Set();
+  const seenActorKeys = new Set();
 
   for (const token of canvas.tokens.placeables || []) {
     const actor = token?.actor;
-    if (!actor || seenActorIds.has(actor.id)) continue;
-    seenActorIds.add(actor.id);
+    const actorKey = getAuraTargetActorKey(token);
+    if (!actor || seenActorKeys.has(actorKey)) continue;
+    seenActorKeys.add(actorKey);
 
     const copies = actor.items.filter(item => {
       const copy = getAuraCopyConfig(item);
@@ -1469,6 +1583,7 @@ async function tickAuras() {
 
 async function updateAuraCopies(tokens, activeAuras) {
   const actorTokenGroups = new Map();
+  const auraEffectCatalog = getKnownAuraEffectCatalog(activeAuras);
 
   for (const token of tokens) {
     if (!token.actor) continue;
@@ -1566,6 +1681,8 @@ async function updateAuraCopies(tokens, activeAuras) {
         }
       }
     }
+
+    await reconcileAuraActorActiveEffects(actor, auraEffectCatalog);
   }
 }
 
@@ -1622,7 +1739,261 @@ async function deleteCopiedAuraItems(actor, items) {
     }
   }
 
+  await cleanupAuraActiveEffectsForItemIds(actor, ids);
   refreshActorAfterAuraCopyChange(actor);
+}
+
+function getActorActiveEffect(actor, id) {
+  if (!actor || !id || !actor.effects) return null;
+
+  try {
+    return actor.effects.get?.(id) || null;
+  } catch (_) {}
+
+  try {
+    return Array.from(actor.effects || []).find(effect => effect?.id === id) || null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function getAuraEffectConfig(effect) {
+  return getFlagWithLegacy(effect, PPA.FLAG_EFFECT);
+}
+
+function getActiveEffectOriginItemId(effect) {
+  const flagItemId = effect?.flags?.pf1?.origin?.item;
+  if (flagItemId) return String(flagItemId);
+
+  const origin = String(effect?.origin || "");
+  const matches = Array.from(origin.matchAll(/(?:^|\.)Item\.([^.]+)/g));
+  return matches.length ? matches[matches.length - 1][1] : null;
+}
+
+function normalizeAuraEffectText(value) {
+  return String(value || "").trim().toLocaleLowerCase();
+}
+
+function getAuraEffectSignature(document) {
+  const name = normalizeAuraEffectText(document?.name || document?.label);
+  const image = normalizeAuraEffectText(document?.img || document?.icon);
+  return {
+    name,
+    image,
+    full: name ? `${name}|${image}` : ""
+  };
+}
+
+function getKnownAuraEffectCatalog(activeAuras = []) {
+  const catalog = {
+    full: new Set(),
+    names: new Set()
+  };
+
+  const addItem = item => {
+    const signature = getAuraEffectSignature(item);
+    if (signature.full) catalog.full.add(signature.full);
+    if (signature.name) catalog.names.add(signature.name);
+  };
+
+  for (const aura of activeAuras || []) addItem(aura?.sourceItem);
+
+  const seenActorKeys = new Set();
+  for (const token of canvas?.tokens?.placeables || []) {
+    if (!token?.actor) continue;
+    const actorKey = getAuraTargetActorKey(token);
+    if (seenActorKeys.has(actorKey)) continue;
+    seenActorKeys.add(actorKey);
+
+    for (const item of token.actor.items || []) {
+      if (getAuraConfig(item)?.isAura === true || getAuraCopyConfig(item)) addItem(item);
+    }
+  }
+
+  return catalog;
+}
+
+function effectMatchesKnownAura(effect, catalog) {
+  if (!catalog) return false;
+  const signature = getAuraEffectSignature(effect);
+  if (signature.full && catalog.full.has(signature.full)) return true;
+  return !!signature.name && !signature.image && catalog.names.has(signature.name);
+}
+
+async function safeSetAuraEffectFlag(effect, copyItem, copy) {
+  if (!effect || !copyItem || !copy) return false;
+
+  const expected = {
+    targetItemId: copyItem.id,
+    sceneId: copy.sceneId || null,
+    sourceTokenId: copy.sourceTokenId || null,
+    sourceItemId: copy.sourceItemId || null
+  };
+  const current = getAuraEffectConfig(effect) || {};
+  if (Object.keys(expected).every(key => current[key] === expected[key])) return true;
+
+  try {
+    await effect.setFlag(PPA.ID, PPA.FLAG_EFFECT, expected);
+    return true;
+  } catch (err) {
+    if (!isMissingEmbeddedDocumentError(err)) {
+      console.warn("Pathfinder 1e Auras: cannot mark aura ActiveEffect", err);
+    }
+    return false;
+  }
+}
+
+async function safeDeleteActorActiveEffects(actor, effects) {
+  if (!actor || !effects?.length) return 0;
+  const ids = [...new Set(effects.map(effect => effect?.id).filter(Boolean))];
+  let deleted = 0;
+
+  for (const id of ids) {
+    try {
+      const effect = getActorActiveEffect(actor, id);
+      if (!effect) continue;
+      const originItem = getActorItem(actor, getActiveEffectOriginItemId(effect));
+      const deleteContext = originItem?.uuid
+        ? { pf1: { delete: originItem.uuid } }
+        : {};
+
+      if (typeof effect.delete === "function") {
+        await effect.delete(deleteContext);
+      } else {
+        await actor.deleteEmbeddedDocuments("ActiveEffect", [id], deleteContext);
+      }
+      deleted += 1;
+    } catch (err) {
+      if (isMissingEmbeddedDocumentError(err)) continue;
+      console.warn("Pathfinder 1e Auras: cannot delete ActiveEffect", id, err);
+    }
+  }
+
+  return deleted;
+}
+
+async function cleanupAuraActiveEffectsForItemIds(actor, itemIds) {
+  if (!actor || !itemIds?.length) return 0;
+  const wantedIds = new Set(itemIds.filter(Boolean));
+  const effects = Array.from(actor.effects || []).filter(effect => {
+    const originItemId = getActiveEffectOriginItemId(effect);
+    const markerItemId = getAuraEffectConfig(effect)?.targetItemId;
+    return wantedIds.has(originItemId) || wantedIds.has(markerItemId);
+  });
+
+  return safeDeleteActorActiveEffects(actor, effects);
+}
+
+async function reconcileAuraActorActiveEffects(actor, catalog = null) {
+  if (!actor) return;
+  const actorKey = actor.uuid || `${actor.documentName || "Actor"}.${actor.id}`;
+  if (PPA.reconcilingAuraEffectActors.has(actorKey)) return;
+  PPA.reconcilingAuraEffectActors.add(actorKey);
+
+  try {
+    const knownCatalog = catalog || getKnownAuraEffectCatalog();
+    const copyItems = new Map();
+    for (const item of actor.items || []) {
+      const copy = getAuraCopyConfig(item);
+      if (copy && item?.id) copyItems.set(item.id, { item, copy });
+    }
+
+    const retainedEffectByCopyItem = new Map();
+    const toDelete = [];
+    const toMark = [];
+
+    for (const effect of actor.effects || []) {
+      const marker = getAuraEffectConfig(effect);
+      const originItemId = getActiveEffectOriginItemId(effect);
+      const originItem = originItemId ? getActorItem(actor, originItemId) : null;
+      const markerItemId = marker?.targetItemId || null;
+      const copyItemId = getAuraCopyConfig(originItem)
+        ? originItemId
+        : (copyItems.has(markerItemId) ? markerItemId : null);
+
+      if (copyItemId) {
+        if (retainedEffectByCopyItem.has(copyItemId)) {
+          toDelete.push(effect);
+          continue;
+        }
+
+        retainedEffectByCopyItem.set(copyItemId, effect);
+        const copyEntry = copyItems.get(copyItemId);
+        if (copyEntry) toMark.push({ effect, ...copyEntry });
+        continue;
+      }
+
+      if (marker) {
+        toDelete.push(effect);
+        continue;
+      }
+
+      // Старые версии не помечали ActiveEffect. Узнаём их только тогда, когда
+      // исходного предмета уже нет, а имя и иконка совпадают с известной аурой.
+      if (originItemId && !originItem && effectMatchesKnownAura(effect, knownCatalog)) {
+        toDelete.push(effect);
+      }
+    }
+
+    await safeDeleteActorActiveEffects(actor, toDelete);
+
+    for (const entry of toMark) {
+      if (!getActorActiveEffect(actor, entry.effect.id)) continue;
+      await safeSetAuraEffectFlag(entry.effect, entry.item, entry.copy);
+    }
+  } finally {
+    PPA.reconcilingAuraEffectActors.delete(actorKey);
+  }
+}
+
+async function disableActorEffectItems(actor) {
+  if (!actor?.items) return 0;
+  let disabled = 0;
+
+  for (const item of Array.from(actor.items || [])) {
+    if (getAuraCopyConfig(item)) continue;
+    let itemDisabled = false;
+
+    const aura = getAuraConfig(item);
+    if (aura?.isAura === true && aura?.isNegative === true && aura.negativeAuraActive === true) {
+      const updated = await safeSetAuraFlag(item, { ...aura, negativeAuraActive: false });
+      if (updated) itemDisabled = true;
+    }
+
+    if (item.type === "buff" && item.system?.active === true) {
+      try {
+        await item.update({ "system.active": false });
+        itemDisabled = true;
+      } catch (err) {
+        if (!isMissingEmbeddedDocumentError(err)) {
+          console.warn("Pathfinder 1e Auras: cannot disable actor buff", item.id, err);
+        }
+      }
+    }
+
+    if (itemDisabled) disabled += 1;
+  }
+
+  return disabled;
+}
+
+async function clearActorConditions(actor) {
+  const conditions = actor?.system?.attributes?.conditions;
+  if (!conditions || typeof conditions !== "object") return;
+
+  const updates = {};
+  for (const [key, value] of Object.entries(conditions)) {
+    if (value === true) updates[`system.attributes.conditions.${key}`] = false;
+  }
+  if (!Object.keys(updates).length) return;
+
+  try {
+    await actor.update(updates);
+  } catch (err) {
+    if (!isMissingEmbeddedDocumentError(err)) {
+      console.warn("Pathfinder 1e Auras: cannot clear actor conditions", err);
+    }
+  }
 }
 
 function refreshActorAfterAuraCopyChange(actor) {

@@ -1,7 +1,7 @@
 {
     "id":  "pf1e-auras",
     "title":  "Pathfinder 1e Auras",
-    "description":  "Р С’Р Р†РЎвЂљР С•Р СР В°РЎвЂљР С‘РЎвЂЎР ВµРЎРѓР С”Р С‘Р Вµ Р С”Р С•Р СР В°Р Р…Р Т‘Р Р…РЎвЂ№Р Вµ Р В°РЎС“РЎР‚РЎвЂ№ Р Т‘Р В»РЎРЏ Pathfinder 1e Р Р…Р В° Foundry VTT 11.",
+    "description":  "РђРІС‚РѕРјР°С‚РёС‡РµСЃРєРёРµ РєРѕРјР°РЅРґРЅС‹Рµ Р°СѓСЂС‹ РґР»СЏ Pathfinder 1e РЅР° Foundry VTT 11.",
     "version":  "0.1.19",
     "authors":  [
                     {
@@ -25,7 +25,7 @@
     "languages":  [
                       {
                           "lang":  "ru",
-                          "name":  "Р В РЎС“РЎРѓРЎРѓР С”Р С‘Р в„–",
+                          "name":  "Р СѓСЃСЃРєРёР№",
                           "path":  "lang/ru.json"
                       }
                   ],
