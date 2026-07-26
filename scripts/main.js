@@ -1,5 +1,5 @@
 /*
- * Pathfinder 1e Auras v0.1.19
+ * Pathfinder 1e Auras v0.1.20
  * Foundry VTT 11.315 / PF1e first playable version, negative aura source toggle decoupling patch.
  *
  * Основная идея:
@@ -2138,6 +2138,17 @@ async function ensureAuraTemplate(sourceToken, sourceItem, cfg) {
   }
 
   if (!templateObject) {
+    const templateFlags = {
+      [PPA.ID]: {
+        template: true,
+        sourceTokenId: sourceToken.id,
+        sourceActorId: sourceToken.actor.id,
+        sourceItemId: sourceItem.id,
+        config: desiredConfig
+      }
+    };
+    if (isLevelsModuleActive()) templateFlags.levels = { elevation: 0 };
+
     const created = await canvas.scene.createEmbeddedDocuments("MeasuredTemplate", [{
       t: "circle",
       user: game.user.id,
@@ -2147,18 +2158,7 @@ async function ensureAuraTemplate(sourceToken, sourceItem, cfg) {
       direction: 0,
       fillColor: game.user.color || "#00ffff",
       hidden: false,
-      flags: {
-        [PPA.ID]: {
-          template: true,
-          sourceTokenId: sourceToken.id,
-          sourceActorId: sourceToken.actor.id,
-          sourceItemId: sourceItem.id,
-          config: desiredConfig
-        },
-        levels: {
-          elevation: 0
-        }
-      }
+      flags: templateFlags
     }]);
 
     templateId = created[0].id;
@@ -2418,13 +2418,26 @@ function getAuraTemplateElevationResetUpdates(templateDocument) {
   const updates = {};
   if (!templateDocument) return updates;
 
-  const levelsElevation = templateDocument.getFlag?.("levels", "elevation") ?? templateDocument.flags?.levels?.elevation;
-  if (levelsElevation !== 0) updates["flags.levels.elevation"] = 0;
+  // Foundry выбрасывает исключение при getFlag для отсутствующего или выключенного
+  // модуля. Levels — необязательная интеграция, поэтому читаем его флаг напрямую
+  // и только когда сам модуль действительно активен.
+  if (isLevelsModuleActive()) {
+    const levelsElevation = templateDocument.flags?.levels?.elevation;
+    if (levelsElevation !== 0) updates["flags.levels.elevation"] = 0;
+  }
 
   const coreElevation = Number(templateDocument.elevation);
   if (Number.isFinite(coreElevation) && coreElevation !== 0) updates.elevation = 0;
 
   return updates;
+}
+
+function isLevelsModuleActive() {
+  try {
+    return game.modules?.get?.("levels")?.active === true;
+  } catch (_) {
+    return false;
+  }
 }
 
 function removeLevelsTemplateTooltip(templateObject) {
